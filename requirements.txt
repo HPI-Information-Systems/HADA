@@ -1,0 +1,8 @@
+hdbcli
+black
+flake8
+isort
+streamlit
+streamlit-ace
+pandas
+Pillow

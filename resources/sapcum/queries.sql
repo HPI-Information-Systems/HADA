@@ -1,0 +1,56 @@
+SELECT
+SUM( "ItemSet"."WRSHB" ) AS "WRSHB",
+"ItemSet"."WAERS" AS "WAERS" ,
+"ItemSet"."KUNNR" AS "KUNNR",
+"ItemSet"."BUKRS" AS "BUKRS",
+"ItemSet"."AUGST" AS "AUGST",
+"ItemSet"."ZUONR" AS "ZUONR",
+"ItemSet"."BELNR" AS "BELNR",
+"ItemSet"."BUZEI" AS "BUZEI",
+"ItemSet"."BLART" AS "BLART",
+"ItemSet"."BLDAT" AS "BLDAT",
+"ItemSet"."UMSKZ" AS "UMSKZ",
+"ItemSet"."AUGBL" AS "AUGBL",
+"ItemSet"."SGTXT" AS "SGTXT",
+"ItemSet"."MANSP" AS "MANSP",
+"ItemSet"."ZLSPR" AS "ZLSPR",
+"ItemSet"."GJAHR" AS "GJAHR"
+FROM "SAPCUM"."ZAKCLI0C" AS "ItemSet"
+WHERE "ItemSet"."TYPE" IS NOT NULL  AND ( "ItemSet"."TYPE" = 'M'
+OR "ItemSet"."TYPE" = 'S'  OR "ItemSet"."TYPE" = 'N'
+OR "ItemSet"."TYPE" = 'P' )
+AND "ItemSet"."KEYDT" IS NOT NULL  AND "ItemSet"."KEYDT" = '20140601'
+AND ("ItemSet"."BUDAT" IS NULL  OR "ItemSet"."BUDAT" <= '20140601' )
+AND ("ItemSet"."AUGDT" IS NULL  OR "ItemSet"."AUGDT" > '20140601'
+OR "ItemSet"."AUGDT" = '00000000'  OR "ItemSet"."AUGDT" = ''
+OR "ItemSet"."AUGDT" = ' ' )
+AND "ItemSet"."KOART" IS NOT NULL  AND ("ItemSet"."KOART" = 'D'
+OR "ItemSet"."KOART" = 'K')
+AND "ItemSet"."MANDT" = '902'
+GROUP BY "ItemSet"."KUNNR",
+"ItemSet"."BUKRS",  "ItemSet"."AUGST",
+"ItemSet"."ZUONR",  "ItemSet"."BELNR",
+"ItemSet"."BUZEI",  "ItemSet"."BLART",
+"ItemSet"."BLDAT",  "ItemSet"."UMSKZ",
+"ItemSet"."AUGBL",  "ItemSet"."SGTXT",
+"ItemSet"."MANSP",  "ItemSet"."ZLSPR",
+"ItemSet"."GJAHR",  "ItemSet"."WAERS"
+ORDER BY "WRSHB" asc LIMIT 100 OFFSET 0 WITH PARAMETERS( 'LOCALE' = 'EN' )
+WITH HINT(IGNORE_PLAN_CACHE);
+
+SELECT
+SALESORDER,
+SALESORDERITEM,
+SALESORGANIZATION,
+DISTRIBUTIONCHANNEL,
+ORGANIZATIONDIVISION,
+SALESORDERTYPE,
+ISSUE,
+ISSUECATEGORY,
+DUEDAYS,
+DUEDATE,
+NMBROFITEMSINORDER
+FROM
+  sapcum.ISOFISSUESO05( '20141017' )
+  where mandt = '715'
+WITH HINT(IGNORE_PLAN_CACHE);

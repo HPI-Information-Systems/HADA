@@ -1,0 +1,10 @@
+SET SESSION 'CDS_CLIENT'='910';
+create global temporary table tempt ( MATNR NVARCHAR(100), WERKS NVARCHAR(20));
+insert into tempt values ('MM_FERT_00000_BN_______________PROLONGED','M101');
+insert into tempt values ('MM_FERT_00000_BN_______________PROLONGED','M202');
+insert into tempt values ('MM_FERT_00000_BN_______________PROLONGED','M201');
+insert into tempt values ('MM_FERT_00000_BN_______________PROLONGED','M102');
+insert into tempt values ('MM_FERT_00000_BN_______________PROLONGED','M204');
+insert into tempt values ('MM_FERT_00000_BN_______________PROLONGED','M103');
+insert into tempt values ('MM_FERT_00000_BN_______________PROLONGED','M203');
+insert into tempt values ('MM_FERT_00000_BN_______________PROLONGED','M104');
