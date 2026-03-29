@@ -1,6 +1,6 @@
-# Find data dependencies for extended `TableScanSemiJoin` (TSSJ)
+# HADA: HANA Data Dependency Assistant
 
-**Note: Relies on non-master HANA instance, required adaptations are in https://hdbgerrit.wdf.sap.corp/c/hana/+/1603703.**
+[//]: # (**Note: Relies on non-main HANA instance, required adaptations are in https://hdbgerrit.wdf.sap.corp/c/hana/+/1603703.**)
 
 Automatic SQL-based dependency discovery for the rewrite, i.e., candidate generation and validation plus SQL rewriting using the validated dependencies.
 Candidates are generated based on information from `EXPLAIN PLAN` statements.
