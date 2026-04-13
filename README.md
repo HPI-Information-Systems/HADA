@@ -1,4 +1,11 @@
 # HADA: HANA Data Dependency Assistant
+<div align="center">
+
+[![HADA Demonstration Screencast](https://img.youtube.com/vi/d_Ans-DByB4/maxresdefault.jpg)](https://youtu.be/d_Ans-DByB4)
+
+### [HADA Demonstration Screencast](https://youtu.be/d_Ans-DByB4)
+
+</div>
 
 [//]: # (**Note: Relies on non-main HANA instance, required adaptations are in https://hdbgerrit.wdf.sap.corp/c/hana/+/1603703.**)
 
