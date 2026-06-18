@@ -4,6 +4,10 @@ import time
 from collections import defaultdict
 
 from data_dependencies import DependencyType, FunctionalDependency, OdCandidateRhs, OrderDependency
+from estimate_genuiness_score import FunctionalDependency as GenuinenessFd
+from estimate_genuiness_score import GenuinenessEstimator
+from estimate_genuiness_score import OdGenuinenessEstimator
+from estimate_genuiness_score import OrderDependency as GenuinenessOd
 from hdbcli import dbapi
 from query_plan import Column, Operator, OperatorType, PredicateCondition, Query
 
@@ -16,6 +20,12 @@ class DependencyDiscoveryRunner:
         self.valid_ods = defaultdict(set)
         self.invalid_fds = defaultdict(set)
         self.invalid_ods = defaultdict(set)
+        # determinant -> {dependent_column: genuineness_score}, populated for every
+        # FD candidate that validate_fd() finds invalid.
+        self.fd_genuineness = defaultdict(dict)
+        # determinant -> {rhs_tuple: genuineness_score}, populated for every
+        # OD candidate that validate_od_with_query() finds invalid.
+        self.od_genuineness = defaultdict(dict)
         self.cursor = None
         self.connection = None
         self.fd_rewrite = fd_rewrite
@@ -578,7 +588,112 @@ class DependencyDiscoveryRunner:
             if is_dependent and no_nulls:
                 self.valid_fds[determinant].add(dependent_columns[dependent_idx])
             else:
-                self.invalid_fds[determinant].add(dependent_columns[dependent_idx])
+                dependent_column = dependent_columns[dependent_idx]
+                self.invalid_fds[determinant].add(dependent_column)
+                self.fd_genuineness[determinant][dependent_column] = self.compute_fd_genuineness(
+                    determinant, dependent_column
+                )
+
+    def compute_fd_genuineness(self, determinant, dependent_column):
+        """Computes the genuineness score (Algorithm 1, "Estimate Genuineness Score")
+        of the invalid FD candidate `determinant -> dependent_column` against the
+        real data: the probability that the FD would still hold if every row whose
+        dependent value disagrees with its determinant's majority redrew that value
+        from the empirical distribution observed for that determinant value.
+
+        Mirrors the playground bridge in genuineness_from_duckdb.py, but runs the
+        grouping query against the live database connection instead of DuckDB.
+        """
+        assert determinant.table_name == dependent_column.table_name
+        table = determinant.table_name
+        lhs_col = determinant.column_name
+        rhs_col = dependent_column.column_name
+
+        query = f"""
+        WITH grp AS (
+            SELECT {lhs_col}, {rhs_col}, COUNT(*) AS cnt
+            FROM {self.table_schema(table)}.{table}
+            WHERE {lhs_col} IS NOT NULL AND {rhs_col} IS NOT NULL
+            GROUP BY {lhs_col}, {rhs_col}
+        ),
+        ambiguous AS (
+            SELECT {lhs_col}
+            FROM grp
+            GROUP BY {lhs_col}
+            HAVING COUNT(*) > 1
+        )
+        SELECT grp.{lhs_col}, grp.{rhs_col}, grp.cnt
+        FROM grp
+        JOIN ambiguous ON grp.{lhs_col} = ambiguous.{lhs_col}
+        """
+        self.cursor.execute(query)
+        rows = self.cursor.fetchall()
+
+        rhs_counts_by_lhs = defaultdict(dict)
+        for lhs_value, rhs_value, cnt in rows:
+            rhs_counts_by_lhs[(lhs_value,)][(rhs_value,)] = cnt
+
+        fd = GenuinenessFd(lhs=(lhs_col,), rhs=(rhs_col,))
+        estimator = GenuinenessEstimator(fd)
+
+        score = 1.0
+        for lhs_value, rhs_counts in rhs_counts_by_lhs.items():
+            total = sum(rhs_counts.values())
+            distribution = {rhs: cnt / total for rhs, cnt in rhs_counts.items()}
+            group_rows = [{lhs_col: lhs_value[0], "distribution": distribution} for _ in range(total)]
+            score *= estimator.estimate(group_rows)
+
+        return score
+
+    def compute_od_genuineness(self, determinant, rhs_columns):
+        """Computes the genuineness score of the invalid OD candidate
+        `determinant |=> rhs_columns` against the real data: the probability that
+        the OD would still hold if every row whose rhs tuple disagrees with its
+        determinant's majority redrew that tuple from the empirical distribution
+        observed for that determinant value.
+
+        An OD combines two constraints: rows sharing a determinant value must
+        agree on the SAME rhs tuple (an embedded FD, handled per group exactly
+        like compute_fd_genuineness), and the agreed-upon tuples must be
+        lexicographically non-decreasing across determinant values in sorted
+        order (handled by OdGenuinenessEstimator's chained DP - see its
+        docstring for why adjacent-group checks suffice).
+        """
+        assert determinant.table_name == rhs_columns[0].table_name
+        table = determinant.table_name
+        lhs_col = determinant.column_name
+        rhs_cols = [c.column_name for c in rhs_columns]
+
+        not_null = " AND ".join(f"{c} IS NOT NULL" for c in [lhs_col] + rhs_cols)
+        query = f"""
+        SELECT {lhs_col}, {", ".join(rhs_cols)}, COUNT(*) AS cnt
+        FROM {self.table_schema(table)}.{table}
+        WHERE {not_null}
+        GROUP BY {lhs_col}, {", ".join(rhs_cols)}
+        """
+        self.cursor.execute(query)
+        rows = self.cursor.fetchall()
+
+        rhs_counts_by_lhs = defaultdict(dict)
+        for row in rows:
+            lhs_value = row[0]
+            rhs_value = tuple(row[1:-1])
+            cnt = row[-1]
+            rhs_counts_by_lhs[lhs_value][rhs_value] = cnt
+
+        groups = []
+        for lhs_value in sorted(rhs_counts_by_lhs):
+            rhs_counts = rhs_counts_by_lhs[lhs_value]
+            total = sum(rhs_counts.values())
+            # Probability that every one of the `total` rows sharing this lhs
+            # value independently redraws to the SAME rhs tuple v: each row
+            # draws v with probability cnt_v / total, so all of them doing so
+            # is (cnt_v / total) ** total - mirrors compute_fd_genuineness.
+            distribution = {v: (cnt / total) ** total for v, cnt in rhs_counts.items()}
+            groups.append((lhs_value, distribution))
+
+        od = GenuinenessOd(lhs=(lhs_col,), rhs=tuple(rhs_cols))
+        return OdGenuinenessEstimator(od).estimate(groups)
 
     def validate_od(self, determinant, right_hand_sides):
         # As everything depends on one single column, we only have to sort and retrieve the result set once and run
@@ -672,7 +787,11 @@ class DependencyDiscoveryRunner:
             if marker == 0:
                 self.add_valid_od(determinant, tuple(permutations[result_id]))
             else:
-                self.invalid_ods[determinant].add(tuple(permutations[result_id]))
+                rhs_tuple = tuple(permutations[result_id])
+                self.invalid_ods[determinant].add(rhs_tuple)
+                self.od_genuineness[determinant][rhs_tuple] = self.compute_od_genuineness(
+                    determinant, list(rhs_tuple)
+                )
 
     def validate_od_with_query_rank(self, common_table, determinant, permutations):
         query_template = """SELECT {0}

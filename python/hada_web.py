@@ -436,6 +436,13 @@ def main():
                 display: inline-block; padding: 3px 8px; border-radius: 12px;
                 font-size: 0.75em; font-weight: bold; margin-right: 8px;
             }
+            .dep-score {
+                display: inline-block; padding: 3px 8px; border-radius: 12px;
+                font-size: 0.75em; font-weight: bold; margin-right: 8px;
+            }
+            .low-score-badge { background-color: #dc3545; color: white; }
+            .medium-score-badge { background-color: #ffc107; color: black; }
+            .high-score-badge { background-color: #28a745; color: white; }
             .fd-badge { background-color: #4CAF50; color: white; }
             .od-badge { background-color: #2196F3; color: white; }
             .valid-badge { background-color: #28a745; color: white; }
@@ -544,21 +551,29 @@ WHERE d_year BETWEEN 2000 AND 2002
     AND ca_country = 'United States'
     AND d_moy >= 6;""",
             "fds": {
-                # FD cs_order_number -> ... enables HASH JOIN -> TSSJ transformation
+                # FD cr_order_number -> cr_item_sk: enables HASH JOIN -> TSSJ transformation
+                Column("catalog_returns_sanitized", "cr_order_number"): {
+                    Column("catalog_returns_sanitized", "cr_item_sk"),
+                },
+                # FD cs_order_number -> cs_item_sk
                 Column("catalog_sales_sanitized", "cs_order_number"): {
-                    Column("catalog_sales_sanitized", "cs_bill_customer_sk"),
-                    Column("catalog_sales_sanitized", "cs_sold_date_sk")
+                    Column("catalog_sales_sanitized", "cs_item_sk"),
+                },
+                # FD c_customer_sk -> c_customer_id
+                Column("customer", "c_customer_sk"): {
+                    Column("customer", "c_customer_id"),
                 },
             },
             "ods": {
                 # OD d_year, d_moy |-> d_date_sk: enables BETWEEN predicate
                 Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"), Column("date_dim", "d_moy"))},
-                # OD cs_order_number |-> cs_sold_date_sk: enables BETWEEN on cs_item_sk
-                Column("catalog_sales_sanitized", "cs_order_number"): {(Column("catalog_sales_sanitized", "cs_sold_date_sk"),)},
+                # OD ca_address_sk |-> ca_country: enables BETWEEN predicate
+                Column("customer_address", "ca_address_sk"): {(Column("customer_address", "ca_country"),)},
             },
             "candidates": [
-                ("FD", Column("customer", "c_customer_sk"), {Column("customer", "c_customer_id")}),
-                ("OD", Column("customer_address", "ca_address_sk"), [Column("customer_address", "ca_country")]),
+                ("FD", Column("customer", "c_customer_sk"), {Column("customer", "c_birth_country")}, 0.9),
+                ("OD", Column("customer_address", "ca_address_sk"), [Column("customer_address", "ca_state")], 0.2),
+                ("FD", Column("date_dim", "d_date_sk"), {Column("date_dim", "d_week_seq")}, 0.6),
             ],
             # Original plan without hints: HASH JOIN for fact table join, TSSJs for dimensions
             "original_plan": {
@@ -581,24 +596,8 @@ WHERE d_year BETWEEN 2000 AND 2002
             },
             # Rewritten plan variants depending on which dependencies are selected
             "rewritten_plans": {
-                "od_date": {
-                    # OD d_year, d_moy -> d_date_sk: TSSJ gets BETWEEN predicate
-                    'nodes': [
-                        {'id': 1, 'parent_id': None, 'name': 'PROJECT', 'details': 'cr_order_number, cr_item_sk', 'table': None, 'children': []},
-                        {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk', 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 3, 'parent_id': 2, 'name': 'catalog_returns_sanitized', 'details': None, 'table': 'catalog_returns_sanitized', 'children': []},
-                        {'id': 4, 'parent_id': 2, 'name': 'TSSJ', 'details': 'cs_bill_customer_sk = c_customer_sk', 'table': 'customer', 'children': []},
-                        {'id': 5, 'parent_id': 4, 'name': 'TSSJ', 'details': 'cs_sold_date_sk BETWEEN MIN(d_date_sk) AND MAX(d_date_sk)', 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 6, 'parent_id': 5, 'name': 'catalog_sales_sanitized', 'details': None, 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 7, 'parent_id': 5, 'name': 'TABLE SCAN', 'details': None, 'table': 'date_dim', 'children': []},
-                        {'id': 8, 'parent_id': 4, 'name': 'TSSJ', 'details': 'c_current_addr_sk = ca_address_sk', 'table': 'customer', 'children': []},
-                        {'id': 9, 'parent_id': 8, 'name': 'customer', 'details': None, 'table': 'customer', 'children': []},
-                        {'id': 10, 'parent_id': 8, 'name': 'TABLE SCAN', 'details': None, 'table': 'customer_address', 'children': []},
-                    ],
-                    'root': []
-                },
-                "fd_cs_order": {
-                    # FD cs_order_number: HASH JOIN -> TSSJ
+                "fd_cr_order": {
+                    # FD cr_order_number -> cr_item_sk: HASH JOIN -> TSSJ right below PROJECT
                     'nodes': [
                         {'id': 1, 'parent_id': None, 'name': 'PROJECT', 'details': 'cr_order_number, cr_item_sk', 'table': None, 'children': []},
                         {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk', 'table': 'catalog_sales_sanitized', 'children': []},
@@ -613,27 +612,11 @@ WHERE d_year BETWEEN 2000 AND 2002
                     ],
                     'root': []
                 },
-                "od_cs_order": {
-                    # OD cs_order_number -> cs_sold_date_sk: TSSJ with BETWEEN on cs_item_sk
+                "od_address": {
+                    # OD ca_address_sk -> ca_country: TSSJ gets BETWEEN predicate
                     'nodes': [
                         {'id': 1, 'parent_id': None, 'name': 'PROJECT', 'details': 'cr_order_number, cr_item_sk', 'table': None, 'children': []},
-                        {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk BETWEEN MIN AND MAX', 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 3, 'parent_id': 2, 'name': 'catalog_returns_sanitized', 'details': None, 'table': 'catalog_returns_sanitized', 'children': []},
-                        {'id': 4, 'parent_id': 2, 'name': 'TSSJ', 'details': 'cs_bill_customer_sk = c_customer_sk', 'table': 'customer', 'children': []},
-                        {'id': 5, 'parent_id': 4, 'name': 'TSSJ', 'details': 'cs_sold_date_sk = d_date_sk', 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 6, 'parent_id': 5, 'name': 'catalog_sales_sanitized', 'details': None, 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 7, 'parent_id': 5, 'name': 'TABLE SCAN', 'details': None, 'table': 'date_dim', 'children': []},
-                        {'id': 8, 'parent_id': 4, 'name': 'TSSJ', 'details': 'c_current_addr_sk = ca_address_sk', 'table': 'customer', 'children': []},
-                        {'id': 9, 'parent_id': 8, 'name': 'customer', 'details': None, 'table': 'customer', 'children': []},
-                        {'id': 10, 'parent_id': 8, 'name': 'TABLE SCAN', 'details': None, 'table': 'customer_address', 'children': []},
-                    ],
-                    'root': []
-                },
-                "od_date_fd_cs": {
-                    # OD date + FD cs_order: TSSJ with BETWEEN
-                    'nodes': [
-                        {'id': 1, 'parent_id': None, 'name': 'PROJECT', 'details': 'cr_order_number, cr_item_sk', 'table': None, 'children': []},
-                        {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk', 'table': 'catalog_sales_sanitized', 'children': []},
+                        {'id': 2, 'parent_id': 1, 'name': 'HASH JOIN', 'details': 'cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk', 'table': None, 'children': []},
                         {'id': 3, 'parent_id': 2, 'name': 'catalog_returns_sanitized', 'details': None, 'table': 'catalog_returns_sanitized', 'children': []},
                         {'id': 4, 'parent_id': 2, 'name': 'TSSJ', 'details': 'cs_bill_customer_sk = c_customer_sk', 'table': 'customer', 'children': []},
                         {'id': 5, 'parent_id': 4, 'name': 'TSSJ', 'details': 'cs_sold_date_sk BETWEEN MIN(d_date_sk) AND MAX(d_date_sk)', 'table': 'catalog_sales_sanitized', 'children': []},
@@ -646,10 +629,10 @@ WHERE d_year BETWEEN 2000 AND 2002
                     'root': []
                 },
                 "all": {
-                    # all dependencies selected: BETWEEN on both TSSJs
+                    # FD cr_order_number + OD ca_address_sk: TSSJ below PROJECT, and BETWEEN on cs/date_dim TSSJ
                     'nodes': [
                         {'id': 1, 'parent_id': None, 'name': 'PROJECT', 'details': 'cr_order_number, cr_item_sk', 'table': None, 'children': []},
-                        {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk BETWEEN MIN AND MAX', 'table': 'catalog_sales_sanitized', 'children': []},
+                        {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk', 'table': 'catalog_sales_sanitized', 'children': []},
                         {'id': 3, 'parent_id': 2, 'name': 'catalog_returns_sanitized', 'details': None, 'table': 'catalog_returns_sanitized', 'children': []},
                         {'id': 4, 'parent_id': 2, 'name': 'TSSJ', 'details': 'cs_bill_customer_sk = c_customer_sk', 'table': 'customer', 'children': []},
                         {'id': 5, 'parent_id': 4, 'name': 'TSSJ', 'details': 'cs_sold_date_sk BETWEEN MIN(d_date_sk) AND MAX(d_date_sk)', 'table': 'catalog_sales_sanitized', 'children': []},
@@ -696,8 +679,8 @@ WHERE d_year = 2001 AND d_moy > 2;""",
                 Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"), Column("date_dim", "d_moy"))}
             },
             "candidates": [
-                ("FD", Column("catalog_sales_sanitized", "cs_order_number"), {Column("catalog_sales_sanitized", "cs_warehouse_sk")}),
-                ("OD", Column("date_dim", "d_date_sk"), [Column("date_dim", "d_week_seq")]),
+                ("FD", Column("catalog_sales_sanitized", "cs_order_number"), {Column("catalog_sales_sanitized", "cs_warehouse_sk")}, 0.4),
+                ("OD", Column("date_dim", "d_date_sk"), [Column("date_dim", "d_week_seq")], 0.6),
             ],
             # Original plan: TSSJ with probe table and TABLE SCAN on dimension
             "original_plan": {
@@ -748,8 +731,8 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"),)},
             },
             "candidates": [
-                ("FD", Column("store", "s_store_sk"), {Column("store", "s_zip")}),
-                ("OD", Column("store", "s_store_sk"), [Column("store", "s_state")]),
+                ("FD", Column("store", "s_store_sk"), {Column("store", "s_zip")}, 0.3),
+                ("OD", Column("store", "s_store_sk"), [Column("store", "s_state")], 0.7),
             ],
             # Original plan: 2 TSSJs chained
             "original_plan": {
@@ -917,6 +900,27 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 with st.spinner("Discovering dependencies..."):
                     try:
                         st.session_state.runner.run_single_query(st.session_state.query_input.current)
+                        st.session_state.candidate_deps = [
+                            ("FD", determinant, {dependent}, score)
+                            for determinant, scores_by_dependent in runner.fd_genuineness.items()
+                            for dependent, score in scores_by_dependent.items()
+                        ] + [
+                            ("OD", determinant, list(rhs_tuple), score)
+                            for determinant, scores_by_rhs in runner.od_genuineness.items()
+                            for rhs_tuple, score in scores_by_rhs.items()
+                        ]
+                        # A demo scenario may still be selected while connected to its real
+                        # database - in that case recompute its candidates' genuineness live
+                        # instead of trusting the illustrative literal in demo_queries_dict.
+                        if st.session_state.get("pending_demo_candidates"):
+                            for ctype, clhs, crhs, cscore in st.session_state.pending_demo_candidates:
+                                if ctype == "FD":
+                                    for dependent in crhs:
+                                        cscore = runner.compute_fd_genuineness(clhs, dependent)
+                                        st.session_state.candidate_deps.append(("FD", clhs, {dependent}, cscore))
+                                else:
+                                    cscore = runner.compute_od_genuineness(clhs, list(crhs))
+                                    st.session_state.candidate_deps.append((ctype, clhs, crhs, cscore))
                         st.success("Dependencies discovered!")
                     except Exception as e:
                         st.error(f"Error discovering dependencies: {str(e)}")
@@ -1179,12 +1183,12 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                                             if not any(c[1] == lhs and c[2] == rhs for c in st.session_state.get("candidate_deps", [])):
                                                 if "candidate_deps" not in st.session_state:
                                                     st.session_state.candidate_deps = []
-                                                st.session_state.candidate_deps.append((dtype, lhs, rhs))
+                                                st.session_state.candidate_deps.append((dtype, lhs, rhs, 0.5))
                                         else:  # OD
                                             if not any(c[1] == lhs and c[2] == rhs for c in st.session_state.get("candidate_deps", [])):
                                                 if "candidate_deps" not in st.session_state:
                                                     st.session_state.candidate_deps = []
-                                                st.session_state.candidate_deps.append((dtype, lhs, rhs))
+                                                st.session_state.candidate_deps.append((dtype, lhs, rhs, 0.5))
                                         
                                         # Also remove from validated_candidates if present
                                         cand_key = f"{dtype}_{lhs}_{rhs}"
@@ -1223,7 +1227,7 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                     st.markdown("#### Invalid Dependencies")
                     st.markdown("*These dependencies need validation. Mark as valid to use them.*")
                     
-                    for cidx, (ctype, clhs, crhs) in enumerate(st.session_state.candidate_deps):
+                    for cidx, (ctype, clhs, crhs, cscore) in enumerate(st.session_state.candidate_deps):
                         cand_key = f"{ctype}_{clhs}_{crhs}"
                         is_validated = cand_key in st.session_state.validated_candidates
                         
@@ -1234,9 +1238,12 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                                 st.markdown('<div style="width: 20px; height: 20px; border: 2px dashed #999; border-radius: 50%;"></div>', unsafe_allow_html=True)
                             
                             with cand_row[1]:
+                                cscore_badge = "Genuine" if cscore >= 0.8 else "Medium genuine" if cscore >= 0.5 else "Not genuine"
                                 badge_class = "fd-badge" if ctype == "FD" else "od-badge"
                                 crhs_display = ", ".join(str(c) for c in crhs) if isinstance(crhs, (set, frozenset, list, tuple)) else str(crhs)
-                                st.markdown(f'<span class="dep-badge {badge_class}">{ctype}</span><span class="dep-badge invalid-badge">INVALID</span> <strong>{clhs}</strong> {"->" if ctype == "FD" else "↦"} <strong>{crhs_display}</strong>', unsafe_allow_html=True)
+                                score_class = "high-score-badge" if cscore >= 0.8 else "medium-score-badge" if cscore >= 0.5 else "low-score-badge"
+
+                                st.markdown(f'<span class="dep-badge {badge_class}">{ctype}</span><span class="dep-badge invalid-badge">INVALID</span> <span class="dep-score {score_class}">{cscore_badge} ({cscore})</span> <strong>{clhs}</strong> {"->" if ctype == "FD" else "↦"} <strong>{crhs_display}</strong>', unsafe_allow_html=True)
                             
                             with cand_row[2]:
                                 if st.button("Mark as valid", key=f"cand_btn_{cidx}", type="secondary", use_container_width=True):
@@ -1359,36 +1366,24 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
             return demo_entry.get('rewritten_plan', demo_entry.get('original_plan', {}))
         
         # Check which relevant dependencies are selected
-        has_od_date = False
-        has_fd_cs_order = False
-        has_od_cs_order = False
-        
+        has_fd_cr_order = False
+        has_od_address = False
+
         for dep_label in selected_deps:
-            # Check for OD on date_dim (d_date_sk ↦ [d_year, d_moy] or similar)
-            if "OD:" in dep_label and "date_dim" in dep_label and "d_date_sk" in dep_label:
-                has_od_date = True
-            # Check for FD on catalog_sales (cs_order_number -> ...)
-            if "FD:" in dep_label and "catalog_sales" in dep_label and "cs_order_number" in dep_label:
-                has_fd_cs_order = True
-            # Check for OD on catalog_sales (cs_order_number ↦ [cs_sold_date_sk])
-            if "OD:" in dep_label and "catalog_sales" in dep_label and "cs_order_number" in dep_label:
-                has_od_cs_order = True
-        
+            # Check for FD on catalog_returns (cr_order_number -> cr_item_sk)
+            if "FD:" in dep_label and "catalog_returns" in dep_label and "cr_order_number" in dep_label:
+                has_fd_cr_order = True
+            # Check for OD on customer_address (ca_address_sk ↦ [ca_country])
+            if "OD:" in dep_label and "customer_address" in dep_label and "ca_address_sk" in dep_label:
+                has_od_address = True
+
         # Select the appropriate plan variant
-        if has_od_date and has_fd_cs_order and has_od_cs_order:
+        if has_fd_cr_order and has_od_address:
             plan_key = "all"
-        elif has_od_date and has_fd_cs_order:
-            plan_key = "od_date_fd_cs"
-        elif has_od_date and has_od_cs_order:
-            plan_key = "all"  # OD date + OD cs_order is close to "all"
-        elif has_fd_cs_order and has_od_cs_order:
-            plan_key = "od_cs_order"  # OD cs_order dominates
-        elif has_od_date:
-            plan_key = "od_date"
-        elif has_fd_cs_order:
-            plan_key = "fd_cs_order"
-        elif has_od_cs_order:
-            plan_key = "od_cs_order"
+        elif has_fd_cr_order:
+            plan_key = "fd_cr_order"
+        elif has_od_address:
+            plan_key = "od_address"
         else:
             plan_key = "none"
         
