@@ -4,8 +4,8 @@ import time
 from collections import defaultdict
 
 from data_dependencies import DependencyType, FunctionalDependency, OdCandidateRhs, OrderDependency
+from estimate_genuiness_score import GENUINENESS_SCORES, FdStats, PapenbrockScore
 from estimate_genuiness_score import FunctionalDependency as GenuinenessFd
-from estimate_genuiness_score import GenuinenessEstimator
 from estimate_genuiness_score import OdGenuinenessEstimator
 from estimate_genuiness_score import OrderDependency as GenuinenessOd
 from hdbcli import dbapi
@@ -15,7 +15,7 @@ from query_plan import Column, Operator, OperatorType, PredicateCondition, Query
 
 
 class DependencyDiscoveryRunner:
-    def __init__(self, schemas, fd_rewrite, od_rewrite, od_strategy, od_batch_size):
+    def __init__(self, schemas, fd_rewrite, od_rewrite, od_strategy, od_batch_size, genuineness_strategy="papenbrock"):
         self.valid_fds = defaultdict(set)
         self.valid_ods = defaultdict(set)
         self.invalid_fds = defaultdict(set)
@@ -32,6 +32,7 @@ class DependencyDiscoveryRunner:
         self.od_rewrite = od_rewrite
         self.od_validation_strategy = od_strategy
         self.od_batch_size = od_batch_size
+        self.genuineness_score = GENUINENESS_SCORES[genuineness_strategy]()
         self.schemas = schemas
         self.catalog = None
         self.table_mapping = None
@@ -595,20 +596,31 @@ class DependencyDiscoveryRunner:
                 )
 
     def compute_fd_genuineness(self, determinant, dependent_column):
-        """Computes the genuineness score (Algorithm 1, "Estimate Genuineness Score")
-        of the invalid FD candidate `determinant -> dependent_column` against the
-        real data: the probability that the FD would still hold if every row whose
-        dependent value disagrees with its determinant's majority redrew that value
-        from the empirical distribution observed for that determinant value.
-
-        Mirrors the playground bridge in genuineness_from_duckdb.py, but runs the
-        grouping query against the live database connection instead of DuckDB.
+        """Computes the genuineness score of the invalid FD candidate
+        `determinant -> dependent_column` against the real data, using whichever
+        GenuinenessScore strategy was configured (see GENUINENESS_SCORES in
+        estimate_genuiness_score.py): the default "papenbrock" strategy instead scores how plausible a real FD of this
+        shape looks (Papenbrock et al. 2017, Section 7.2 "Violating FD selection"); 
+        the alternative "probabilistic" strategy (Algorithm 1, "Estimate Genuineness Score") computes the probability that
+        the FD would still hold if every row whose dependent value disagrees with
+        its determinant's majority redrew that value from the empirical
+        distribution observed for that determinant value.
         """
         assert determinant.table_name == dependent_column.table_name
         table = determinant.table_name
         lhs_col = determinant.column_name
         rhs_col = dependent_column.column_name
 
+        fd = GenuinenessFd(lhs=(lhs_col,), rhs=(rhs_col,))
+
+        if isinstance(self.genuineness_score, PapenbrockScore):
+            stats = self.compute_papenbrock_stats(table, (lhs_col,), (rhs_col,))
+        else:
+            stats = self.compute_fd_probabilistic_stats(table, lhs_col, rhs_col)
+
+        return self.genuineness_score.score(fd, stats)
+
+    def compute_fd_probabilistic_stats(self, table, lhs_col, rhs_col):
         query = f"""
         WITH grp AS (
             SELECT {lhs_col}, {rhs_col}, COUNT(*) AS cnt
@@ -633,17 +645,34 @@ class DependencyDiscoveryRunner:
         for lhs_value, rhs_value, cnt in rows:
             rhs_counts_by_lhs[(lhs_value,)][(rhs_value,)] = cnt
 
-        fd = GenuinenessFd(lhs=(lhs_col,), rhs=(rhs_col,))
-        estimator = GenuinenessEstimator(fd)
+        return FdStats(rhs_counts_by_lhs=rhs_counts_by_lhs)
 
-        score = 1.0
-        for lhs_value, rhs_counts in rhs_counts_by_lhs.items():
-            total = sum(rhs_counts.values())
-            distribution = {rhs: cnt / total for rhs, cnt in rhs_counts.items()}
-            group_rows = [{lhs_col: lhs_value[0], "distribution": distribution} for _ in range(total)]
-            score *= estimator.estimate(group_rows)
+    def compute_papenbrock_stats(self, table, lhs_cols, rhs_cols):
+        """Gathers the stats needed by PapenbrockScore (length/value/position
+        features) for a violating dependency `lhs_cols -> rhs_cols`, an FD or an
+        OD - the features apply unchanged to both.
+        """
+        schema = self.table_schema(table)
 
-        return score
+        self.cursor.execute(
+            f"SELECT COLUMN_NAME, POSITION FROM COLUMNS WHERE SCHEMA_NAME = '{schema}' AND TABLE_NAME = '{table}'"
+        )
+        positions = {column_name: position for column_name, position in self.cursor.fetchall()}
+
+        lhs_max_value_length = 0
+        for lhs_col in lhs_cols:
+            self.cursor.execute(
+                f"SELECT MAX(LENGTH(TO_NVARCHAR({lhs_col}))) FROM {schema}.{table} WHERE {lhs_col} IS NOT NULL"
+            )
+            (max_length,) = self.cursor.fetchone()
+            lhs_max_value_length = max(lhs_max_value_length, max_length or 0)
+
+        return FdStats(
+            relation_attribute_count=len(positions),
+            lhs_positions=tuple(positions[c] for c in lhs_cols),
+            rhs_positions=tuple(positions[c] for c in rhs_cols),
+            lhs_max_value_length=lhs_max_value_length,
+        )
 
     def compute_od_genuineness(self, determinant, rhs_columns):
         """Computes the genuineness score of the invalid OD candidate
@@ -658,11 +687,21 @@ class DependencyDiscoveryRunner:
         lexicographically non-decreasing across determinant values in sorted
         order (handled by OdGenuinenessEstimator's chained DP - see its
         docstring for why adjacent-group checks suffice).
+
+        With the "papenbrock" strategy, neither of these matters: the OD is
+        instead scored on how plausible a real dependency of this shape looks
+        (Papenbrock et al. 2017, Section 7.2 "Violating FD selection"), the same
+        way as for FDs.
         """
         assert determinant.table_name == rhs_columns[0].table_name
         table = determinant.table_name
         lhs_col = determinant.column_name
         rhs_cols = [c.column_name for c in rhs_columns]
+
+        if isinstance(self.genuineness_score, PapenbrockScore):
+            od = GenuinenessOd(lhs=(lhs_col,), rhs=tuple(rhs_cols))
+            stats = self.compute_papenbrock_stats(table, (lhs_col,), tuple(rhs_cols))
+            return self.genuineness_score.score(od, stats)
 
         not_null = " AND ".join(f"{c} IS NOT NULL" for c in [lhs_col] + rhs_cols)
         query = f"""
