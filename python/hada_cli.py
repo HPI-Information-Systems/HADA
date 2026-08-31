@@ -73,6 +73,16 @@ def parse_args():
         "Smaller values benefit invalid candidates, larger values benefit valid candidates. Default: 1000",
     )
     parser.add_argument(
+        "--genuineness-strategy",
+        type=str,
+        default="probabilistic",
+        choices=["probabilistic", "papenbrock"],
+        help="Strategy used to score the genuineness of violating FD/OD candidates. 'probabilistic' estimates the "
+        "probability that the dependency would still hold under the data's belief distribution (Algorithm 1); "
+        "'papenbrock' instead scores how plausible a real dependency of this shape looks (Papenbrock et al. 2017, "
+        "violating FD selection). Default: probabilistic",
+    )
+    parser.add_argument(
         "--db-connection-file",
         type=str,
         default="./database_connection.json",
@@ -95,7 +105,7 @@ if __name__ == "__main__":
 
     connection_info = load_connection_info(args.db_connection_file)
     runner = DependencyDiscoveryRunner(
-        args.schema, args.fd_rewrite, args.od_rewrite, args.od_strategy, args.od_batch_size
+        args.schema, args.fd_rewrite, args.od_rewrite, args.od_strategy, args.od_batch_size, args.genuineness_strategy
     )
     runner.get_cursor(
         connection_info["host"],

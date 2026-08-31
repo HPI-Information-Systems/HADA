@@ -4,6 +4,10 @@ import time
 from collections import defaultdict
 
 from data_dependencies import DependencyType, FunctionalDependency, OdCandidateRhs, OrderDependency
+from estimate_genuiness_score import GENUINENESS_SCORES, FdStats, PapenbrockScore
+from estimate_genuiness_score import FunctionalDependency as GenuinenessFd
+from estimate_genuiness_score import OdGenuinenessEstimator
+from estimate_genuiness_score import OrderDependency as GenuinenessOd
 from hdbcli import dbapi
 from query_plan import Column, Operator, OperatorType, PredicateCondition, Query
 
@@ -11,17 +15,30 @@ from query_plan import Column, Operator, OperatorType, PredicateCondition, Query
 
 
 class DependencyDiscoveryRunner:
-    def __init__(self, schemas, fd_rewrite, od_rewrite, od_strategy, od_batch_size):
+    def __init__(self, schemas, fd_rewrite, od_rewrite, od_strategy, od_batch_size, genuineness_strategy="papenbrock"):
         self.valid_fds = defaultdict(set)
         self.valid_ods = defaultdict(set)
         self.invalid_fds = defaultdict(set)
         self.invalid_ods = defaultdict(set)
+        # determinant -> {dependent_column: genuineness_score}, populated for every
+        # FD candidate that validate_fd() finds invalid.
+        self.fd_genuineness = defaultdict(dict)
+        # determinant -> {rhs_tuple: genuineness_score}, populated for every
+        # OD candidate that validation finds invalid (via add_invalid_od,
+        # regardless of the OD validation strategy used).
+        self.od_genuineness = defaultdict(dict)
+        # Same as fd_genuineness/od_genuineness, but for the dependencies that
+        # validation finds to actually hold - scored the same way so valid and
+        # invalid dependencies can be compared on the same scale.
+        self.valid_fd_genuineness = defaultdict(dict)
+        self.valid_od_genuineness = defaultdict(dict)
         self.cursor = None
         self.connection = None
         self.fd_rewrite = fd_rewrite
         self.od_rewrite = od_rewrite
         self.od_validation_strategy = od_strategy
         self.od_batch_size = od_batch_size
+        self.genuineness_score = GENUINENESS_SCORES[genuineness_strategy]()
         self.schemas = schemas
         self.catalog = None
         self.table_mapping = None
@@ -576,9 +593,156 @@ class DependencyDiscoveryRunner:
             is_dependent = int(res[0][2 * dependent_idx]) == 1
             no_nulls = int(res[0][2 * dependent_idx + 1]) == 0
             if is_dependent and no_nulls:
-                self.valid_fds[determinant].add(dependent_columns[dependent_idx])
+                dependent_column = dependent_columns[dependent_idx]
+                self.valid_fds[determinant].add(dependent_column)
+                self.valid_fd_genuineness[determinant][dependent_column] = self.compute_fd_genuineness(
+                    determinant, dependent_column
+                )
             else:
-                self.invalid_fds[determinant].add(dependent_columns[dependent_idx])
+                dependent_column = dependent_columns[dependent_idx]
+                self.invalid_fds[determinant].add(dependent_column)
+                self.fd_genuineness[determinant][dependent_column] = self.compute_fd_genuineness(
+                    determinant, dependent_column
+                )
+
+    def compute_fd_genuineness(self, determinant, dependent_column):
+        """Computes the genuineness score of the invalid FD candidate
+        `determinant -> dependent_column` against the real data, using whichever
+        GenuinenessScore strategy was configured (see GENUINENESS_SCORES in
+        estimate_genuiness_score.py): the default "papenbrock" strategy instead scores how plausible a real FD of this
+        shape looks (Papenbrock et al. 2017, Section 7.2 "Violating FD selection"); 
+        the alternative "probabilistic" strategy (Algorithm 1, "Estimate Genuineness Score") computes the probability that
+        the FD would still hold if every row whose dependent value disagrees with
+        its determinant's majority redrew that value from the empirical
+        distribution observed for that determinant value.
+        """
+        assert determinant.table_name == dependent_column.table_name
+        table = determinant.table_name
+        lhs_col = determinant.column_name
+        rhs_col = dependent_column.column_name
+
+        fd = GenuinenessFd(lhs=(lhs_col,), rhs=(rhs_col,))
+
+        if isinstance(self.genuineness_score, PapenbrockScore):
+            stats = self.compute_papenbrock_stats(table, (lhs_col,), (rhs_col,))
+        else:
+            stats = self.compute_fd_probabilistic_stats(table, lhs_col, rhs_col)
+
+        return self.genuineness_score.score(fd, stats)
+
+    def compute_fd_probabilistic_stats(self, table, lhs_col, rhs_col):
+        query = f"""
+        WITH grp AS (
+            SELECT {lhs_col}, {rhs_col}, COUNT(*) AS cnt
+            FROM {self.table_schema(table)}.{table}
+            WHERE {lhs_col} IS NOT NULL AND {rhs_col} IS NOT NULL
+            GROUP BY {lhs_col}, {rhs_col}
+        ),
+        ambiguous AS (
+            SELECT {lhs_col}
+            FROM grp
+            GROUP BY {lhs_col}
+            HAVING COUNT(*) > 1
+        )
+        SELECT grp.{lhs_col}, grp.{rhs_col}, grp.cnt
+        FROM grp
+        JOIN ambiguous ON grp.{lhs_col} = ambiguous.{lhs_col}
+        """
+        self.cursor.execute(query)
+        rows = self.cursor.fetchall()
+
+        rhs_counts_by_lhs = defaultdict(dict)
+        for lhs_value, rhs_value, cnt in rows:
+            rhs_counts_by_lhs[(lhs_value,)][(rhs_value,)] = cnt
+
+        return FdStats(rhs_counts_by_lhs=rhs_counts_by_lhs)
+
+    def compute_papenbrock_stats(self, table, lhs_cols, rhs_cols):
+        """Gathers the stats needed by PapenbrockScore (length/value/position
+        features) for a violating dependency `lhs_cols -> rhs_cols`, an FD or an
+        OD - the features apply unchanged to both.
+        """
+        schema = self.table_schema(table)
+
+        self.cursor.execute(
+            f"SELECT COLUMN_NAME, POSITION FROM COLUMNS WHERE SCHEMA_NAME = '{schema}' AND TABLE_NAME = '{table}'"
+        )
+        positions = {column_name: position for column_name, position in self.cursor.fetchall()}
+
+        lhs_max_value_length = 0
+        for lhs_col in lhs_cols:
+            self.cursor.execute(
+                f"SELECT MAX(LENGTH(TO_NVARCHAR({lhs_col}))) FROM {schema}.{table} WHERE {lhs_col} IS NOT NULL"
+            )
+            (max_length,) = self.cursor.fetchone()
+            lhs_max_value_length = max(lhs_max_value_length, max_length or 0)
+
+        return FdStats(
+            relation_attribute_count=len(positions),
+            lhs_positions=tuple(positions[c] for c in lhs_cols),
+            rhs_positions=tuple(positions[c] for c in rhs_cols),
+            lhs_max_value_length=lhs_max_value_length,
+        )
+
+    def compute_od_genuineness(self, determinant, rhs_columns):
+        """Computes the genuineness score of the invalid OD candidate
+        `determinant |=> rhs_columns` against the real data: the probability that
+        the OD would still hold if every row whose rhs tuple disagrees with its
+        determinant's majority redrew that tuple from the empirical distribution
+        observed for that determinant value.
+
+        An OD combines two constraints: rows sharing a determinant value must
+        agree on the SAME rhs tuple (an embedded FD, handled per group exactly
+        like compute_fd_genuineness), and the agreed-upon tuples must be
+        lexicographically non-decreasing across determinant values in sorted
+        order (handled by OdGenuinenessEstimator's chained DP - see its
+        docstring for why adjacent-group checks suffice).
+
+        With the "papenbrock" strategy, neither of these matters: the OD is
+        instead scored on how plausible a real dependency of this shape looks
+        (Papenbrock et al. 2017, Section 7.2 "Violating FD selection"), the same
+        way as for FDs.
+        """
+        assert determinant.table_name == rhs_columns[0].table_name
+        table = determinant.table_name
+        lhs_col = determinant.column_name
+        rhs_cols = [c.column_name for c in rhs_columns]
+
+        if isinstance(self.genuineness_score, PapenbrockScore):
+            od = GenuinenessOd(lhs=(lhs_col,), rhs=tuple(rhs_cols))
+            stats = self.compute_papenbrock_stats(table, (lhs_col,), tuple(rhs_cols))
+            return self.genuineness_score.score(od, stats)
+
+        not_null = " AND ".join(f"{c} IS NOT NULL" for c in [lhs_col] + rhs_cols)
+        query = f"""
+        SELECT {lhs_col}, {", ".join(rhs_cols)}, COUNT(*) AS cnt
+        FROM {self.table_schema(table)}.{table}
+        WHERE {not_null}
+        GROUP BY {lhs_col}, {", ".join(rhs_cols)}
+        """
+        self.cursor.execute(query)
+        rows = self.cursor.fetchall()
+
+        rhs_counts_by_lhs = defaultdict(dict)
+        for row in rows:
+            lhs_value = row[0]
+            rhs_value = tuple(row[1:-1])
+            cnt = row[-1]
+            rhs_counts_by_lhs[lhs_value][rhs_value] = cnt
+
+        groups = []
+        for lhs_value in sorted(rhs_counts_by_lhs):
+            rhs_counts = rhs_counts_by_lhs[lhs_value]
+            total = sum(rhs_counts.values())
+            # Probability that every one of the `total` rows sharing this lhs
+            # value independently redraws to the SAME rhs tuple v: each row
+            # draws v with probability cnt_v / total, so all of them doing so
+            # is (cnt_v / total) ** total - mirrors compute_fd_genuineness.
+            distribution = {v: (cnt / total) ** total for v, cnt in rhs_counts.items()}
+            groups.append((lhs_value, distribution))
+
+        od = GenuinenessOd(lhs=(lhs_col,), rhs=tuple(rhs_cols))
+        return OdGenuinenessEstimator(od).estimate(groups)
 
     def validate_od(self, determinant, right_hand_sides):
         # As everything depends on one single column, we only have to sort and retrieve the result set once and run
@@ -672,7 +836,7 @@ class DependencyDiscoveryRunner:
             if marker == 0:
                 self.add_valid_od(determinant, tuple(permutations[result_id]))
             else:
-                self.invalid_ods[determinant].add(tuple(permutations[result_id]))
+                self.add_invalid_od(determinant, tuple(permutations[result_id]))
 
     def validate_od_with_query_rank(self, common_table, determinant, permutations):
         query_template = """SELECT {0}
@@ -713,7 +877,7 @@ class DependencyDiscoveryRunner:
             if marker >= 0:
                 self.add_valid_od(determinant, tuple(permutations[result_id]))
             else:
-                self.invalid_ods[determinant].add(tuple(permutations[result_id]))
+                self.add_invalid_od(determinant, tuple(permutations[result_id]))
 
     def validate_od_with_checkers(self, common_table, determinant, permutations, unique_query_columns):
         query_template = "SELECT {0} FROM {1} ORDER BY {2} WITH HINT(IGNORE_PLAN_CACHE)"
@@ -758,7 +922,7 @@ class DependencyDiscoveryRunner:
                 self.add_valid_od(determinant, checker.to_od())
                 valid_count += 1
             else:
-                self.invalid_ods[determinant].add(checker.to_od())
+                self.add_invalid_od(determinant, checker.to_od())
 
     def run_od_checkers(self, query, checkers):
         fetch_next = True
@@ -799,9 +963,20 @@ class DependencyDiscoveryRunner:
                 # New OD refines already known OD. We cannot simply transform the existing one (stored as a tuple for
                 # hashability in the RHS set), so we have to delete the existing RHS and add the new one.
                 self.valid_ods[lhs].remove(known_rhs)
+                self.valid_od_genuineness[lhs].pop(known_rhs, None)
                 break
 
         self.valid_ods[lhs].add(rhs)
+        # Score the valid OD the same way invalid ones are scored (see
+        # add_invalid_od), so both can be compared on the same scale.
+        self.valid_od_genuineness[lhs][rhs] = self.compute_od_genuineness(lhs, list(rhs))
+
+    def add_invalid_od(self, lhs, rhs):
+        # Single registration point for invalid ODs (mirrors add_valid_od), used
+        # by all OD validation strategies so the genuineness score is computed
+        # regardless of which strategy rejected the OD.
+        self.invalid_ods[lhs].add(rhs)
+        self.od_genuineness[lhs][rhs] = self.compute_od_genuineness(lhs, list(rhs))
 
 
 class OdChecker:

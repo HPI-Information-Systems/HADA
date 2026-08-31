@@ -17,11 +17,14 @@ We support functional dependencies (FDs) and order dependencies (ODs) because th
 
 
 ## Components
+
 - `python/` contains the dependency discovery implementation:
+
   - `dependency_discovery.py` provides the core `DependencyDiscoveryRunner` class with all steps of the pipeline.
   - `hada_cli.py` provides a CLI for the pipeline execution.
   - `hada_web.py` provides a web-based UI for interactive dependency exploration and query rewriting.
   - `query_plan.py` and  `data_dependencies.py` serve data structures used to represent the parsed plans and the (candidate) dependencies.
+  - `estimate_genuiness_score.py` provides the `GenuinenessEstimator`/`OdGenuinenessEstimator` classes used to score invalid FD/OD candidates (see [Genuineness scoring](#genuineness-scoring) below).
 
 - `resources/` contains sample workloads.
 - `docs/` contains additional documentation, including [`FRONTEND.md`](docs/FRONTEND.md) for the web interface.
@@ -48,11 +51,13 @@ streamlit run python/hada_web.py
 ### Requirements
 
 Additional Python packages for the web interface:
+
 ```sh
 pip install streamlit streamlit-ace pandas Pillow
 ```
 
 ## Workflow
+
 ```mermaid
 flowchart LR;
     Start --> queryFiles["Load queries<br />from file"];
@@ -64,11 +69,14 @@ flowchart LR;
     validateCandidates --> planPrompt["Prompt rewritten<br />queries with<br />dependency SQL hints"];
 ```
 
+
 ## Usage
+
 The  `DependencyDiscoveryRunner` class performs all of the individual pipeline steps.
 When executed via the `hada_cli.py` script, it exeutes the entire pipeline for multiple queries in a batch, depending on the provided CLI parameters.
 
 ```
+
   --schema SCHEMA [SCHEMA ...], -s SCHEMA [SCHEMA ...]
                         Used schema(s). Default: SYSTEM
   --fd-rewrite          Generate and validate candidates for the FD-based
@@ -110,6 +118,7 @@ Subdirectories are named after the corresponding schema, with an optional counte
 The data can be optionally loaded and dropped from the script to automate these steps, too.
 
 See some usage examples below:
+
 ```sh
 # Full run incl. data loading and unloading and targeting both rewrites
 ./python/hada_cli.py -s TPCDS -i resources/tpcds/import.sql -q resources/tpcds/queries.sql --od-rewrite --drop-schema
@@ -127,6 +136,7 @@ See some usage examples below:
 Further filtering joins in between the target semi-join and the base table can prevent the rewrite.**
 
 ## Details
+
 The dependency validation is simplified to facilitate the use cases of the targeted query rewrites.
 One major simplifiation is to restrict to FD and OD candidates with a single left-hand side (LHS).
 Doing so, we can collect all candidates with the same LHS column and validate them using a single SQL query.
@@ -134,8 +144,10 @@ Doing so, we can collect all candidates with the same LHS column and validate th
 To speedup the incremental scenario, there are internal caches for the validation results (both vor valid and invalid candidates).
 
 ### FD validation
+
 All candidates with the same LHS are grouped and validated on one go, exploiting that valid FDs have exactly one not-`NULL` dependent value per determinant value.
 We use a query template that looks like this for an example FD candidate `{ column_a } → { column_b, column_c, ... }` on `table_a` :
+
 ```SQL
 SELECT max(column_b_dst),
        max(column_b_has_null),
@@ -161,8 +173,10 @@ This is relevant for the rewrite because unselected tuples with the same determi
 For each dependent candidate, we get two result fields (first must be `1`, second must be `0`) that we can simply iterate.
 
 ### OD validation
+
 Similarly to the FD validation, we issue only a single query for all OD candidates with the same LHS column.
 For example, let the following be an input query:
+
 ```SQL
 SELECT catalog_sales.*
   FROM catalog_sales INNER MANY TO ONE JOIN date_dim ON cs_sold_date = d_date_sk
@@ -174,6 +188,7 @@ SELECT catalog_sales.*
 We have to check the two candidates `[ d_date_sk ] ↦ [ d_year, d_moy, d_dom ]` and `[ d_date_sk ] ↦ [ d_moy, d_year, d_dom ]`
 (candidates from equality predicates can have any permutations of these columns).
 We could order only once and fetch the result set:
+
 ```SQL
   SELECT d_year, d_moy, d_dom
     FROM date_dim
@@ -193,6 +208,7 @@ For our sample data ([`tpcds_demo`](resources/tpcds_demo/), comparing many tuple
 We could use window functions with ranks and compare these ranks, but the queries become rather complex if we have multiple candidates.
 One issue is that we have to check all possible permutations of the candidate columns that come from equality predicates.
 For the candidates above, a plain SQL validation query could look like this:
+
 ```SQL
 SELECT min(valid_d_year_d_moy_d_dom),
        min(valid_d_moy_d_year_d_dom)
@@ -213,9 +229,20 @@ This approach avoids materializing a large result set, but requires to order the
 It can be chosen by passing `--od-strategy query_rank`.
 Even though we sort multiple times, it was faster than the checker-based solution for a valid OD on a large table (with only two permutations).
 
+### Genuineness scoring
+
+Invalid FD/OD candidates are not simply discarded - each is also assigned a *genuineness score*: the probability that the dependency would still hold if every row whose value disagrees with its determinant's majority had instead independently redrawn that value from the empirical distribution observed for that determinant value, rather than being treated as a hard violation. A score close to `1` means the candidate looks "almost valid" (a handful of probably-noisy rows), while a score close to `0` means the violations look structural rather than noise.
+
+Both estimators live in `estimate_genuiness_score.py` and are populated automatically as a side effect of validation: `DependencyDiscoveryRunner.validate_fd` calls `compute_fd_genuineness` whenever it marks a candidate invalid, and `validate_od_with_query` calls `compute_od_genuineness` likewise - results land in `runner.fd_genuineness[determinant][dependent]` / `runner.od_genuineness[determinant][rhs_tuple]`. The web UI (`hada_web.py`) surfaces these as the score shown next to each invalid candidate under "Invalid Dependencies". This is only computed against a live, connected database; the disconnected demo mode shows illustrative hardcoded scores instead, since there is no data to query.
+
+**FD genuineness** (`GenuinenessEstimator`, implementing "Algorithm 1 - Estimate Genuineness Score" from Berti-Équille et al.): for FD `lhs -> rhs`, group rows by `lhs` value and read off the empirical frequency of each `rhs` value within that group as a per-row redraw probability. Different `lhs` groups can never violate the FD against each other, so the overall score is the product of each group's own score - each group's score is the probability that all of its rows happen to redraw to the same value, computed via depth-first branching over per-row choices with an explicit stack (to avoid Python's recursion-depth limit on large tables).
+
+**OD genuineness** (`OdGenuinenessEstimator`): an OD combines two constraints - rows sharing a determinant value must agree on the same RHS tuple (an FD embedded within each group, scored the same way as above), and the agreed-upon tuples must be lexicographically non-decreasing across determinant values in sorted order. Because `<=` is transitive, that second constraint only needs to be checked between *consecutive* groups, so `OdGenuinenessEstimator` runs a DP chained over groups (state = the value the previous group committed to) instead of the FD case's independent multiplication.
+
 The ranks are only a helper to facilitate OD candidates on non-numeric columns or with multiple columns, where the DB performs the lexicograhical ordering.
 Instead, we could perform the lexicograhical comparisons for the candidates ourselves.
 By using case statements, we avoid sorting multiple times and compare the values directly:
+
 ```SQL
 SELECT min(valid_d_year_d_moy_d_dom),
        min(valid_d_moy_d_year_d_dom)
@@ -241,6 +268,7 @@ SELECT min(valid_d_year_d_moy_d_dom),
                ) internal_get_prev
        ) internal_compare;
 ```
+
 Intuitively, evaluating these case statements should be also not cheap on larger tables.
 For our sample data, this approach was the fastest.
 Thus, this approach is the current default OD validation strategy.

@@ -66,6 +66,8 @@ def reset_dependency_state():
     if hasattr(st.session_state, 'runner'):
         st.session_state.runner.valid_fds.clear()
         st.session_state.runner.valid_ods.clear()
+        st.session_state.runner.valid_fd_genuineness.clear()
+        st.session_state.runner.valid_od_genuineness.clear()
 
 
 def remove_duplicate_hints(query_str):
@@ -114,7 +116,7 @@ def remove_duplicate_hints(query_str):
     return result
 
 
-def format_dependency_hint(dtype, lhs, rhs, color_idx=None):
+def format_dependency_hint(dtype, lhs, rhs, schema="SYSTEM", color_idx=None):
     try:
         lhs_cols = [f'"{lhs.column_name}"']
         table = lhs.table_name
@@ -122,18 +124,37 @@ def format_dependency_hint(dtype, lhs, rhs, color_idx=None):
             rhs_cols = [f'"{c.column_name}"' for c in rhs]
         else:
             rhs_cols = [f'"{rhs.column_name}"'] if hasattr(rhs, 'column_name') else []
-        table_full = f"SYSTEM.{table}"
+        table_full = f"{schema}.{table}"
         return (
             f'{{"type": "{dtype}", "table": "{table_full}", '
             f'"lhs": [{", ".join(lhs_cols)}], "rhs": [{", ".join(rhs_cols)}]}}'
         )
     except Exception:
-        return '{"type": "FD", "table": "SYSTEM.DEMO", "lhs": [], "rhs": []}'
+        return f'{{"type": "FD", "table": "{schema}.DEMO", "lhs": [], "rhs": []}}'
 
 
 def apply_rewrite_to_query(base_query, hint_json_list):
+    """Attach the dependency hint the same way DependencyDiscoveryRunner.add_hint does:
+    split on the statement terminator so the hint lands before it, and enable the HEX
+    table scan semi join rules that actually consume DEV_DATA_DEPENDENCIES."""
     hint_payload = ", ".join(hint_json_list) if isinstance(hint_json_list, (list, tuple)) else str(hint_json_list)
-    rewritten = base_query + f"\nWITH HINT(DEV_DATA_DEPENDENCIES('[{hint_payload}]'))"
+    dependencies_str = f"DEV_DATA_DEPENDENCIES('[{hint_payload}]')"
+
+    rewritten = ""
+    for query_part in base_query.split(";"):
+        if not query_part.strip():
+            continue
+        hint_splits = re.split(r"WITH\s+HINT\s*\(", query_part, flags=re.IGNORECASE)
+        rewritten += hint_splits[0]
+        if not rewritten.endswith("\n"):
+            rewritten += "\n"
+        has_hint = len(hint_splits) > 1
+        rewritten += (
+            f"WITH HINT(HEX_TABLE_SCAN_SEMI_JOIN, DEV_HEX_EXTENDED_TABLE_SCAN_SEMI_JOIN, {dependencies_str}"
+            f"""{", " + hint_splits[1] if has_hint else ")"}"""
+        )
+        if not rewritten.endswith(";"):
+            rewritten += ";"
     return remove_duplicate_hints(rewritten)
 
 
@@ -436,6 +457,13 @@ def main():
                 display: inline-block; padding: 3px 8px; border-radius: 12px;
                 font-size: 0.75em; font-weight: bold; margin-right: 8px;
             }
+            .dep-score {
+                display: inline-block; padding: 3px 8px; border-radius: 12px;
+                font-size: 0.75em; font-weight: bold; margin-right: 8px;
+            }
+            .low-score-badge { background-color: #dc3545; color: white; }
+            .medium-score-badge { background-color: #ffc107; color: black; }
+            .high-score-badge { background-color: #28a745; color: white; }
             .fd-badge { background-color: #4CAF50; color: white; }
             .od-badge { background-color: #2196F3; color: white; }
             .valid-badge { background-color: #28a745; color: white; }
@@ -504,6 +532,7 @@ def main():
             st.session_state.candidate_deps = []
             st.session_state.user_validated_fds = {}
             st.session_state.user_validated_ods = {}
+            st.session_state.user_validated_scores = {}
             st.session_state.query_input.current = ""
             st.session_state.query_input.previous = ""
             st.session_state.has_query = False
@@ -520,12 +549,16 @@ def main():
             # Also clear pending demo data so it won't auto-load
             st.session_state.pending_demo_fds = {}
             st.session_state.pending_demo_ods = {}
+            st.session_state.pending_demo_fd_scores = {}
+            st.session_state.pending_demo_od_scores = {}
             st.session_state.pending_demo_candidates = []
             st.session_state.just_loaded_demo_query = False
             # Clear runner data
             if hasattr(st.session_state, 'runner'):
                 st.session_state.runner.valid_fds.clear()
                 st.session_state.runner.valid_ods.clear()
+                st.session_state.runner.valid_fd_genuineness.clear()
+                st.session_state.runner.valid_od_genuineness.clear()
             st.rerun()
 
     # Demo queries with query plan variants based on selected dependencies
@@ -544,21 +577,40 @@ WHERE d_year BETWEEN 2000 AND 2002
     AND ca_country = 'United States'
     AND d_moy >= 6;""",
             "fds": {
-                # FD cs_order_number -> ... enables HASH JOIN -> TSSJ transformation
+                # FD cr_order_number -> cr_item_sk: enables HASH JOIN -> TSSJ transformation
+                Column("catalog_returns_sanitized", "cr_order_number"): {
+                    Column("catalog_returns_sanitized", "cr_item_sk"),
+                },
+                # FD cs_order_number -> cs_item_sk
                 Column("catalog_sales_sanitized", "cs_order_number"): {
-                    Column("catalog_sales_sanitized", "cs_bill_customer_sk"),
-                    Column("catalog_sales_sanitized", "cs_sold_date_sk")
+                    Column("catalog_sales_sanitized", "cs_item_sk"),
+                },
+                # FD c_customer_sk -> c_customer_id
+                Column("customer", "c_customer_sk"): {
+                    Column("customer", "c_customer_id"),
                 },
             },
             "ods": {
                 # OD d_year, d_moy |-> d_date_sk: enables BETWEEN predicate
                 Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"), Column("date_dim", "d_moy"))},
-                # OD cs_order_number |-> cs_sold_date_sk: enables BETWEEN on cs_item_sk
-                Column("catalog_sales_sanitized", "cs_order_number"): {(Column("catalog_sales_sanitized", "cs_sold_date_sk"),)},
+                # OD ca_address_sk |-> ca_country: enables BETWEEN predicate
+                Column("customer_address", "ca_address_sk"): {(Column("customer_address", "ca_country"),)},
+            },
+            # Illustrative genuineness scores for the valid dependencies above, so
+            # demo mode shows the same score tags as a live connection would.
+            "fd_scores": {
+                Column("catalog_returns_sanitized", "cr_order_number"): {Column("catalog_returns_sanitized", "cr_item_sk"): 0.95},
+                Column("catalog_sales_sanitized", "cs_order_number"): {Column("catalog_sales_sanitized", "cs_item_sk"): 0.66},
+                Column("customer", "c_customer_sk"): {Column("customer", "c_customer_id"): 1.0},
+            },
+            "od_scores": {
+                Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"), Column("date_dim", "d_moy")): 0.82},
+                Column("customer_address", "ca_address_sk"): {(Column("customer_address", "ca_country"),): 0.9},
             },
             "candidates": [
-                ("FD", Column("customer", "c_customer_sk"), {Column("customer", "c_customer_id")}),
-                ("OD", Column("customer_address", "ca_address_sk"), [Column("customer_address", "ca_country")]),
+                ("FD", Column("customer", "c_customer_sk"), {Column("customer", "c_birth_country")}, 0.9),
+                ("OD", Column("customer_address", "ca_address_sk"), [Column("customer_address", "ca_state")], 0.2),
+                ("FD", Column("date_dim", "d_date_sk"), {Column("date_dim", "d_week_seq")}, 0.6),
             ],
             # Original plan without hints: HASH JOIN for fact table join, TSSJs for dimensions
             "original_plan": {
@@ -581,24 +633,8 @@ WHERE d_year BETWEEN 2000 AND 2002
             },
             # Rewritten plan variants depending on which dependencies are selected
             "rewritten_plans": {
-                "od_date": {
-                    # OD d_year, d_moy -> d_date_sk: TSSJ gets BETWEEN predicate
-                    'nodes': [
-                        {'id': 1, 'parent_id': None, 'name': 'PROJECT', 'details': 'cr_order_number, cr_item_sk', 'table': None, 'children': []},
-                        {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk', 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 3, 'parent_id': 2, 'name': 'catalog_returns_sanitized', 'details': None, 'table': 'catalog_returns_sanitized', 'children': []},
-                        {'id': 4, 'parent_id': 2, 'name': 'TSSJ', 'details': 'cs_bill_customer_sk = c_customer_sk', 'table': 'customer', 'children': []},
-                        {'id': 5, 'parent_id': 4, 'name': 'TSSJ', 'details': 'cs_sold_date_sk BETWEEN MIN(d_date_sk) AND MAX(d_date_sk)', 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 6, 'parent_id': 5, 'name': 'catalog_sales_sanitized', 'details': None, 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 7, 'parent_id': 5, 'name': 'TABLE SCAN', 'details': None, 'table': 'date_dim', 'children': []},
-                        {'id': 8, 'parent_id': 4, 'name': 'TSSJ', 'details': 'c_current_addr_sk = ca_address_sk', 'table': 'customer', 'children': []},
-                        {'id': 9, 'parent_id': 8, 'name': 'customer', 'details': None, 'table': 'customer', 'children': []},
-                        {'id': 10, 'parent_id': 8, 'name': 'TABLE SCAN', 'details': None, 'table': 'customer_address', 'children': []},
-                    ],
-                    'root': []
-                },
-                "fd_cs_order": {
-                    # FD cs_order_number: HASH JOIN -> TSSJ
+                "fd_cr_order": {
+                    # FD cr_order_number -> cr_item_sk: HASH JOIN -> TSSJ right below PROJECT
                     'nodes': [
                         {'id': 1, 'parent_id': None, 'name': 'PROJECT', 'details': 'cr_order_number, cr_item_sk', 'table': None, 'children': []},
                         {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk', 'table': 'catalog_sales_sanitized', 'children': []},
@@ -613,27 +649,11 @@ WHERE d_year BETWEEN 2000 AND 2002
                     ],
                     'root': []
                 },
-                "od_cs_order": {
-                    # OD cs_order_number -> cs_sold_date_sk: TSSJ with BETWEEN on cs_item_sk
+                "od_address": {
+                    # OD ca_address_sk -> ca_country: TSSJ gets BETWEEN predicate
                     'nodes': [
                         {'id': 1, 'parent_id': None, 'name': 'PROJECT', 'details': 'cr_order_number, cr_item_sk', 'table': None, 'children': []},
-                        {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk BETWEEN MIN AND MAX', 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 3, 'parent_id': 2, 'name': 'catalog_returns_sanitized', 'details': None, 'table': 'catalog_returns_sanitized', 'children': []},
-                        {'id': 4, 'parent_id': 2, 'name': 'TSSJ', 'details': 'cs_bill_customer_sk = c_customer_sk', 'table': 'customer', 'children': []},
-                        {'id': 5, 'parent_id': 4, 'name': 'TSSJ', 'details': 'cs_sold_date_sk = d_date_sk', 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 6, 'parent_id': 5, 'name': 'catalog_sales_sanitized', 'details': None, 'table': 'catalog_sales_sanitized', 'children': []},
-                        {'id': 7, 'parent_id': 5, 'name': 'TABLE SCAN', 'details': None, 'table': 'date_dim', 'children': []},
-                        {'id': 8, 'parent_id': 4, 'name': 'TSSJ', 'details': 'c_current_addr_sk = ca_address_sk', 'table': 'customer', 'children': []},
-                        {'id': 9, 'parent_id': 8, 'name': 'customer', 'details': None, 'table': 'customer', 'children': []},
-                        {'id': 10, 'parent_id': 8, 'name': 'TABLE SCAN', 'details': None, 'table': 'customer_address', 'children': []},
-                    ],
-                    'root': []
-                },
-                "od_date_fd_cs": {
-                    # OD date + FD cs_order: TSSJ with BETWEEN
-                    'nodes': [
-                        {'id': 1, 'parent_id': None, 'name': 'PROJECT', 'details': 'cr_order_number, cr_item_sk', 'table': None, 'children': []},
-                        {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk', 'table': 'catalog_sales_sanitized', 'children': []},
+                        {'id': 2, 'parent_id': 1, 'name': 'HASH JOIN', 'details': 'cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk', 'table': None, 'children': []},
                         {'id': 3, 'parent_id': 2, 'name': 'catalog_returns_sanitized', 'details': None, 'table': 'catalog_returns_sanitized', 'children': []},
                         {'id': 4, 'parent_id': 2, 'name': 'TSSJ', 'details': 'cs_bill_customer_sk = c_customer_sk', 'table': 'customer', 'children': []},
                         {'id': 5, 'parent_id': 4, 'name': 'TSSJ', 'details': 'cs_sold_date_sk BETWEEN MIN(d_date_sk) AND MAX(d_date_sk)', 'table': 'catalog_sales_sanitized', 'children': []},
@@ -646,10 +666,10 @@ WHERE d_year BETWEEN 2000 AND 2002
                     'root': []
                 },
                 "all": {
-                    # all dependencies selected: BETWEEN on both TSSJs
+                    # FD cr_order_number + OD ca_address_sk: TSSJ below PROJECT, and BETWEEN on cs/date_dim TSSJ
                     'nodes': [
                         {'id': 1, 'parent_id': None, 'name': 'PROJECT', 'details': 'cr_order_number, cr_item_sk', 'table': None, 'children': []},
-                        {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk BETWEEN MIN AND MAX', 'table': 'catalog_sales_sanitized', 'children': []},
+                        {'id': 2, 'parent_id': 1, 'name': 'TSSJ', 'details': 'cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk', 'table': 'catalog_sales_sanitized', 'children': []},
                         {'id': 3, 'parent_id': 2, 'name': 'catalog_returns_sanitized', 'details': None, 'table': 'catalog_returns_sanitized', 'children': []},
                         {'id': 4, 'parent_id': 2, 'name': 'TSSJ', 'details': 'cs_bill_customer_sk = c_customer_sk', 'table': 'customer', 'children': []},
                         {'id': 5, 'parent_id': 4, 'name': 'TSSJ', 'details': 'cs_sold_date_sk BETWEEN MIN(d_date_sk) AND MAX(d_date_sk)', 'table': 'catalog_sales_sanitized', 'children': []},
@@ -695,9 +715,12 @@ WHERE d_year = 2001 AND d_moy > 2;""",
                 # OD d_year, d_moy -> d_date_sk
                 Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"), Column("date_dim", "d_moy"))}
             },
+            "od_scores": {
+                Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"), Column("date_dim", "d_moy")): 0.85},
+            },
             "candidates": [
-                ("FD", Column("catalog_sales_sanitized", "cs_order_number"), {Column("catalog_sales_sanitized", "cs_warehouse_sk")}),
-                ("OD", Column("date_dim", "d_date_sk"), [Column("date_dim", "d_week_seq")]),
+                ("FD", Column("catalog_sales_sanitized", "cs_order_number"), {Column("catalog_sales_sanitized", "cs_warehouse_sk")}, 0.4),
+                ("OD", Column("date_dim", "d_date_sk"), [Column("date_dim", "d_week_seq")], 0.6),
             ],
             # Original plan: TSSJ with probe table and TABLE SCAN on dimension
             "original_plan": {
@@ -747,9 +770,12 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 # OD d_year -> d_date_sk
                 Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"),)},
             },
+            "od_scores": {
+                Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"),): 0.78},
+            },
             "candidates": [
-                ("FD", Column("store", "s_store_sk"), {Column("store", "s_zip")}),
-                ("OD", Column("store", "s_store_sk"), [Column("store", "s_state")]),
+                ("FD", Column("store", "s_store_sk"), {Column("store", "s_zip")}, 0.3),
+                ("OD", Column("store", "s_store_sk"), [Column("store", "s_state")], 0.7),
             ],
             # Original plan: 2 TSSJs chained
             "original_plan": {
@@ -817,10 +843,13 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
             st.session_state.candidate_deps = []
             st.session_state.user_validated_fds = {}
             st.session_state.user_validated_ods = {}
+            st.session_state.user_validated_scores = {}
             demo_entry = demo_queries_dict[selected_demo_query]
             # Store demo data for later use when "Discover" is clicked
             st.session_state.pending_demo_fds = demo_entry["fds"]
             st.session_state.pending_demo_ods = demo_entry["ods"]
+            st.session_state.pending_demo_fd_scores = demo_entry.get("fd_scores", {})
+            st.session_state.pending_demo_od_scores = demo_entry.get("od_scores", {})
             st.session_state.pending_demo_candidates = demo_entry.get("candidates", [])
             demo_query = demo_entry["query"]
             st.session_state.query_input.current = demo_query
@@ -896,7 +925,7 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
             tab_size=4,
             key=f"qOriginal-{st.session_state.query_render_key}",
             auto_update=True,
-            height=200,
+            height=215,
         )
         
         if not st.session_state.get("just_loaded_demo_query"):
@@ -917,6 +946,27 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 with st.spinner("Discovering dependencies..."):
                     try:
                         st.session_state.runner.run_single_query(st.session_state.query_input.current)
+                        st.session_state.candidate_deps = [
+                            ("FD", determinant, {dependent}, score)
+                            for determinant, scores_by_dependent in runner.fd_genuineness.items()
+                            for dependent, score in scores_by_dependent.items()
+                        ] + [
+                            ("OD", determinant, list(rhs_tuple), score)
+                            for determinant, scores_by_rhs in runner.od_genuineness.items()
+                            for rhs_tuple, score in scores_by_rhs.items()
+                        ]
+                        # A demo scenario may still be selected while connected to its real
+                        # database - in that case recompute its candidates' genuineness live
+                        # instead of trusting the illustrative literal in demo_queries_dict.
+                        if st.session_state.get("pending_demo_candidates"):
+                            for ctype, clhs, crhs, cscore in st.session_state.pending_demo_candidates:
+                                if ctype == "FD":
+                                    for dependent in crhs:
+                                        cscore = runner.compute_fd_genuineness(clhs, dependent)
+                                        st.session_state.candidate_deps.append(("FD", clhs, {dependent}, cscore))
+                                else:
+                                    cscore = runner.compute_od_genuineness(clhs, list(crhs))
+                                    st.session_state.candidate_deps.append((ctype, clhs, crhs, cscore))
                         st.success("Dependencies discovered!")
                     except Exception as e:
                         st.error(f"Error discovering dependencies: {str(e)}")
@@ -928,6 +978,14 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 if st.session_state.get("pending_demo_ods"):
                     for k, v in st.session_state.pending_demo_ods.items():
                         runner.valid_ods[k] = v
+                # Populate the valid-dependency genuineness scores so the VALID tags
+                # carry a score in demo mode, just like they do on a live connection.
+                if st.session_state.get("pending_demo_fd_scores"):
+                    for k, v in st.session_state.pending_demo_fd_scores.items():
+                        runner.valid_fd_genuineness[k] = dict(v)
+                if st.session_state.get("pending_demo_od_scores"):
+                    for k, v in st.session_state.pending_demo_od_scores.items():
+                        runner.valid_od_genuineness[k] = dict(v)
                 if st.session_state.get("pending_demo_candidates"):
                     st.session_state.candidate_deps = st.session_state.pending_demo_candidates
                 st.success("Demo dependencies discovered!")
@@ -1007,8 +1065,21 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
         # Build valid dependencies list - showing user-validated separately
         valid_dependencies = []
         dep_details = {}
+        # label -> genuineness score for auto-discovered valid deps (None for
+        # user-validated ones, which are never scored).
+        dep_scores = {}
         fd_count = 0
         od_count = 0
+
+        def valid_fd_score(lhs, rhs_cols):
+            # A grouped FD label may cover several rhs columns; report the lowest
+            # (worst) score among the ones we have a score for.
+            scores = [
+                runner.valid_fd_genuineness[lhs][c]
+                for c in rhs_cols
+                if lhs in runner.valid_fd_genuineness and c in runner.valid_fd_genuineness[lhs]
+            ]
+            return min(scores) if scores else None
         
         # Get user-validated dependency labels to exclude from merged display
         user_val_labels = st.session_state.get("manually_added_deps", set())
@@ -1034,13 +1105,15 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                     label = f"FD: {lhs} -> {{{', '.join(str(col) for col in original_rhs)}}}"
                     valid_dependencies.append(label)
                     dep_details[label] = ('FD', lhs, original_rhs)
+                    dep_scores[label] = valid_fd_score(lhs, original_rhs)
                     fd_count += 1
-        
+
         # Add user-validated FDs as separate entries
         for uv_label, (uv_lhs, uv_rhs) in user_val_fds.items():
             if uv_label not in [d for d in valid_dependencies]:
                 valid_dependencies.append(uv_label)
                 dep_details[uv_label] = ('FD', uv_lhs, uv_rhs)
+                dep_scores[uv_label] = st.session_state.get("user_validated_scores", {}).get(uv_label)
                 fd_count += 1
         
         # Handle ODs
@@ -1056,13 +1129,16 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                     if label not in user_val_labels or label not in user_val_ods:
                         valid_dependencies.append(label)
                         dep_details[label] = ('OD', lhs, rhs)
+                        rhs_key = tuple(rhs) if isinstance(rhs, (list, tuple)) else rhs
+                        dep_scores[label] = runner.valid_od_genuineness.get(lhs, {}).get(rhs_key)
                         od_count += 1
-        
-        # Add user-validated ODs as separate entries  
+
+        # Add user-validated ODs as separate entries
         for uv_label, (uv_lhs, uv_rhs) in user_val_ods.items():
             if uv_label not in [d for d in valid_dependencies]:
                 valid_dependencies.append(uv_label)
                 dep_details[uv_label] = ('OD', uv_lhs, uv_rhs)
+                dep_scores[uv_label] = st.session_state.get("user_validated_scores", {}).get(uv_label)
                 od_count += 1
         
         # Summary metrics
@@ -1112,15 +1188,22 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                         
                         with dep_row[1]:
                             badge_class = "fd-badge" if dtype == "FD" else "od-badge"
-                            manual_badge = '<span class="dep-badge manual-badge">MANUAL</span>' if is_selected else ""
                             user_val_badge = '<span class="dep-badge user-validated-badge">USER VALIDATED</span>' if is_user_validated else '<span class="dep-badge valid-badge">VALID</span>'
-                            # Only show column names 
+                            # Genuineness score tag (same scale as the invalid candidates below).
+                            score = dep_scores.get(label)
+                            if score is not None:
+                                score_label = "Genuine" if score >= 0.8 else "Medium genuine" if score >= 0.5 else "Not genuine"
+                                score_class = "high-score-badge" if score >= 0.8 else "medium-score-badge" if score >= 0.5 else "low-score-badge"
+                                score_badge = f'<span class="dep-score {score_class}">{score_label} ({score:.2f})</span>'
+                            else:
+                                score_badge = ""
+                            # Only show column names
                             lhs_col = lhs.column_name if hasattr(lhs, 'column_name') else str(lhs)
                             if isinstance(rhs, (set, frozenset, list, tuple)):
                                 rhs_display = ", ".join(c.column_name if hasattr(c, 'column_name') else str(c) for c in rhs)
                             else:
                                 rhs_display = rhs.column_name if hasattr(rhs, 'column_name') else str(rhs)
-                            st.markdown(f'<span class="dep-badge {badge_class}">{dtype}</span>{user_val_badge}{manual_badge} <strong>{lhs_col}</strong> {"->" if dtype == "FD" else "↦"} <strong>{rhs_display}</strong>', unsafe_allow_html=True)
+                            st.markdown(f'<span class="dep-badge {badge_class}">{dtype}</span>{user_val_badge} {score_badge} <strong>{lhs_col}</strong> {"->" if dtype == "FD" else "↦"} <strong>{rhs_display}</strong>', unsafe_allow_html=True)
                         
                         with dep_row[2]:
                             # Show different buttons based on dependency state
@@ -1172,19 +1255,13 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                                         st.session_state.selected_dependencies_set.discard(label)
                                         if label in st.session_state.selected_dep_colors:
                                             del st.session_state.selected_dep_colors[label]
-                                        # Re-add to candidate_deps so it appears in Invalid section
-                                        # Parse the dependency from the label
-                                        if dtype == "FD":
-                                            # Add back to candidate_deps list
-                                            if not any(c[1] == lhs and c[2] == rhs for c in st.session_state.get("candidate_deps", [])):
-                                                if "candidate_deps" not in st.session_state:
-                                                    st.session_state.candidate_deps = []
-                                                st.session_state.candidate_deps.append((dtype, lhs, rhs))
-                                        else:  # OD
-                                            if not any(c[1] == lhs and c[2] == rhs for c in st.session_state.get("candidate_deps", [])):
-                                                if "candidate_deps" not in st.session_state:
-                                                    st.session_state.candidate_deps = []
-                                                st.session_state.candidate_deps.append((dtype, lhs, rhs))
+                                        # Re-add to candidate_deps so it appears in Invalid section,
+                                        # restoring the score it carried before being validated.
+                                        restored_score = st.session_state.get("user_validated_scores", {}).pop(label, 0.5)
+                                        if not any(c[1] == lhs and c[2] == rhs for c in st.session_state.get("candidate_deps", [])):
+                                            if "candidate_deps" not in st.session_state:
+                                                st.session_state.candidate_deps = []
+                                            st.session_state.candidate_deps.append((dtype, lhs, rhs, restored_score))
                                         
                                         # Also remove from validated_candidates if present
                                         cand_key = f"{dtype}_{lhs}_{rhs}"
@@ -1223,20 +1300,25 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                     st.markdown("#### Invalid Dependencies")
                     st.markdown("*These dependencies need validation. Mark as valid to use them.*")
                     
-                    for cidx, (ctype, clhs, crhs) in enumerate(st.session_state.candidate_deps):
+                    for cidx, (ctype, clhs, crhs, cscore) in enumerate(st.session_state.candidate_deps):
                         cand_key = f"{ctype}_{clhs}_{crhs}"
                         is_validated = cand_key in st.session_state.validated_candidates
                         
                         if not is_validated:  # Only show invalid ones here
-                            cand_row = st.columns([0.08, 0.72, 0.2])
+                            # Same column ratios as the valid-dependency rows above so
+                            # the FD/OD badges line up at the same level and width.
+                            cand_row = st.columns([0.06, 0.59, 0.35])
                             
                             with cand_row[0]:
                                 st.markdown('<div style="width: 20px; height: 20px; border: 2px dashed #999; border-radius: 50%;"></div>', unsafe_allow_html=True)
                             
                             with cand_row[1]:
+                                cscore_badge = "Genuine" if cscore >= 0.8 else "Medium genuine" if cscore >= 0.5 else "Not genuine"
                                 badge_class = "fd-badge" if ctype == "FD" else "od-badge"
                                 crhs_display = ", ".join(str(c) for c in crhs) if isinstance(crhs, (set, frozenset, list, tuple)) else str(crhs)
-                                st.markdown(f'<span class="dep-badge {badge_class}">{ctype}</span><span class="dep-badge invalid-badge">INVALID</span> <strong>{clhs}</strong> {"->" if ctype == "FD" else "↦"} <strong>{crhs_display}</strong>', unsafe_allow_html=True)
+                                score_class = "high-score-badge" if cscore >= 0.8 else "medium-score-badge" if cscore >= 0.5 else "low-score-badge"
+
+                                st.markdown(f'<span class="dep-badge {badge_class}">{ctype}</span><span class="dep-badge invalid-badge">INVALID</span> <span class="dep-score {score_class}">{cscore_badge} ({cscore:.2f})</span> <strong>{clhs}</strong> {"->" if ctype == "FD" else "↦"} <strong>{crhs_display}</strong>', unsafe_allow_html=True)
                             
                             with cand_row[2]:
                                 if st.button("Mark as valid", key=f"cand_btn_{cidx}", type="secondary", use_container_width=True):
@@ -1269,6 +1351,9 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                                         if clhs not in runner.valid_ods:
                                             runner.valid_ods[clhs] = set()
                                         runner.valid_ods[clhs].add(rhs_tuple)
+                                    # Keep the candidate's genuineness score so the
+                                    # user-validated entry can still display it.
+                                    st.session_state.setdefault("user_validated_scores", {})[manual_label] = cscore
                                     # Mark as user validated so it gets the USER VALIDATED badge
                                     st.session_state.manually_added_deps.add(manual_label)
                                     st.success("Dependency validated and marked as USER VALIDATED!")
@@ -1297,7 +1382,7 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 for label in selected_set:
                     if label in dep_details:
                         dtype, lhs, rhs = dep_details[label]
-                        hint_entries.append(format_dependency_hint(dtype, lhs, rhs))
+                        hint_entries.append(format_dependency_hint(dtype, lhs, rhs, selected_schema))
                 
                 if hint_entries:
                     hint_json = f"[{', '.join(hint_entries)}]"
@@ -1316,7 +1401,7 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 for label in selected_set:
                     if label in dep_details:
                         dtype, lhs, rhs = dep_details[label]
-                        hint_entries.append(format_dependency_hint(dtype, lhs, rhs))
+                        hint_entries.append(format_dependency_hint(dtype, lhs, rhs, selected_schema))
                 
                 rewritten = apply_rewrite_to_query(base_query, hint_entries)
                 rewritten = remove_duplicate_hints(rewritten)
@@ -1359,36 +1444,30 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
             return demo_entry.get('rewritten_plan', demo_entry.get('original_plan', {}))
         
         # Check which relevant dependencies are selected
+        has_fd_cr_order = False
+        has_od_address = False
         has_od_date = False
-        has_fd_cs_order = False
-        has_od_cs_order = False
-        
+
         for dep_label in selected_deps:
-            # Check for OD on date_dim (d_date_sk ↦ [d_year, d_moy] or similar)
+            # Check for FD on catalog_returns (cr_order_number -> cr_item_sk)
+            if "FD:" in dep_label and "catalog_returns" in dep_label and "cr_order_number" in dep_label:
+                has_fd_cr_order = True
+            # Check for OD on customer_address (ca_address_sk ↦ [ca_country])
+            if "OD:" in dep_label and "customer_address" in dep_label and "ca_address_sk" in dep_label:
+                has_od_address = True
+            # Check for OD on date_dim (d_date_sk ↦ [d_year, ...])
             if "OD:" in dep_label and "date_dim" in dep_label and "d_date_sk" in dep_label:
                 has_od_date = True
-            # Check for FD on catalog_sales (cs_order_number -> ...)
-            if "FD:" in dep_label and "catalog_sales" in dep_label and "cs_order_number" in dep_label:
-                has_fd_cs_order = True
-            # Check for OD on catalog_sales (cs_order_number ↦ [cs_sold_date_sk])
-            if "OD:" in dep_label and "catalog_sales" in dep_label and "cs_order_number" in dep_label:
-                has_od_cs_order = True
-        
+
         # Select the appropriate plan variant
-        if has_od_date and has_fd_cs_order and has_od_cs_order:
+        if has_fd_cr_order and has_od_address:
             plan_key = "all"
-        elif has_od_date and has_fd_cs_order:
-            plan_key = "od_date_fd_cs"
-        elif has_od_date and has_od_cs_order:
-            plan_key = "all"  # OD date + OD cs_order is close to "all"
-        elif has_fd_cs_order and has_od_cs_order:
-            plan_key = "od_cs_order"  # OD cs_order dominates
+        elif has_fd_cr_order:
+            plan_key = "fd_cr_order"
+        elif has_od_address:
+            plan_key = "od_address"
         elif has_od_date:
             plan_key = "od_date"
-        elif has_fd_cs_order:
-            plan_key = "fd_cs_order"
-        elif has_od_cs_order:
-            plan_key = "od_cs_order"
         else:
             plan_key = "none"
         
@@ -1443,12 +1522,20 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 try:
                     plan_data = parse_explain_plan(runner, st.session_state.query_input.current)
                     st.session_state.original_plan = plan_data
+                    plan_errors = []
+                    if plan_data.get('error'):
+                        plan_errors.append(f"Original query: {plan_data['error']}")
                     
                     if st.session_state.get("rewritten_query"):
                         rewr_plan_data = parse_explain_plan(runner, st.session_state.rewritten_query)
                         st.session_state.rewritten_plan = rewr_plan_data
+                        if rewr_plan_data.get('error'):
+                            plan_errors.append(f"Rewritten query: {rewr_plan_data['error']}")
                     
-                    st.success("Plans generated!")
+                    if plan_errors:
+                        st.error("EXPLAIN PLAN failed:\n\n" + "\n\n".join(plan_errors))
+                    else:
+                        st.success("Plans generated!")
                 except Exception as e:
                     st.error(f"Failed to generate plans: {str(e)}")
     
