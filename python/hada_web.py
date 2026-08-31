@@ -116,7 +116,7 @@ def remove_duplicate_hints(query_str):
     return result
 
 
-def format_dependency_hint(dtype, lhs, rhs, color_idx=None):
+def format_dependency_hint(dtype, lhs, rhs, schema="SYSTEM", color_idx=None):
     try:
         lhs_cols = [f'"{lhs.column_name}"']
         table = lhs.table_name
@@ -124,18 +124,37 @@ def format_dependency_hint(dtype, lhs, rhs, color_idx=None):
             rhs_cols = [f'"{c.column_name}"' for c in rhs]
         else:
             rhs_cols = [f'"{rhs.column_name}"'] if hasattr(rhs, 'column_name') else []
-        table_full = f"SYSTEM.{table}"
+        table_full = f"{schema}.{table}"
         return (
             f'{{"type": "{dtype}", "table": "{table_full}", '
             f'"lhs": [{", ".join(lhs_cols)}], "rhs": [{", ".join(rhs_cols)}]}}'
         )
     except Exception:
-        return '{"type": "FD", "table": "SYSTEM.DEMO", "lhs": [], "rhs": []}'
+        return f'{{"type": "FD", "table": "{schema}.DEMO", "lhs": [], "rhs": []}}'
 
 
 def apply_rewrite_to_query(base_query, hint_json_list):
+    """Attach the dependency hint the same way DependencyDiscoveryRunner.add_hint does:
+    split on the statement terminator so the hint lands before it, and enable the HEX
+    table scan semi join rules that actually consume DEV_DATA_DEPENDENCIES."""
     hint_payload = ", ".join(hint_json_list) if isinstance(hint_json_list, (list, tuple)) else str(hint_json_list)
-    rewritten = base_query + f"\nWITH HINT(DEV_DATA_DEPENDENCIES('[{hint_payload}]'))"
+    dependencies_str = f"DEV_DATA_DEPENDENCIES('[{hint_payload}]')"
+
+    rewritten = ""
+    for query_part in base_query.split(";"):
+        if not query_part.strip():
+            continue
+        hint_splits = re.split(r"WITH\s+HINT\s*\(", query_part, flags=re.IGNORECASE)
+        rewritten += hint_splits[0]
+        if not rewritten.endswith("\n"):
+            rewritten += "\n"
+        has_hint = len(hint_splits) > 1
+        rewritten += (
+            f"WITH HINT(HEX_TABLE_SCAN_SEMI_JOIN, DEV_HEX_EXTENDED_TABLE_SCAN_SEMI_JOIN, {dependencies_str}"
+            f"""{", " + hint_splits[1] if has_hint else ")"}"""
+        )
+        if not rewritten.endswith(";"):
+            rewritten += ";"
     return remove_duplicate_hints(rewritten)
 
 
@@ -1363,7 +1382,7 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 for label in selected_set:
                     if label in dep_details:
                         dtype, lhs, rhs = dep_details[label]
-                        hint_entries.append(format_dependency_hint(dtype, lhs, rhs))
+                        hint_entries.append(format_dependency_hint(dtype, lhs, rhs, selected_schema))
                 
                 if hint_entries:
                     hint_json = f"[{', '.join(hint_entries)}]"
@@ -1382,7 +1401,7 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 for label in selected_set:
                     if label in dep_details:
                         dtype, lhs, rhs = dep_details[label]
-                        hint_entries.append(format_dependency_hint(dtype, lhs, rhs))
+                        hint_entries.append(format_dependency_hint(dtype, lhs, rhs, selected_schema))
                 
                 rewritten = apply_rewrite_to_query(base_query, hint_entries)
                 rewritten = remove_duplicate_hints(rewritten)
@@ -1427,6 +1446,7 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
         # Check which relevant dependencies are selected
         has_fd_cr_order = False
         has_od_address = False
+        has_od_date = False
 
         for dep_label in selected_deps:
             # Check for FD on catalog_returns (cr_order_number -> cr_item_sk)
@@ -1435,6 +1455,9 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
             # Check for OD on customer_address (ca_address_sk ↦ [ca_country])
             if "OD:" in dep_label and "customer_address" in dep_label and "ca_address_sk" in dep_label:
                 has_od_address = True
+            # Check for OD on date_dim (d_date_sk ↦ [d_year, ...])
+            if "OD:" in dep_label and "date_dim" in dep_label and "d_date_sk" in dep_label:
+                has_od_date = True
 
         # Select the appropriate plan variant
         if has_fd_cr_order and has_od_address:
@@ -1443,6 +1466,8 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
             plan_key = "fd_cr_order"
         elif has_od_address:
             plan_key = "od_address"
+        elif has_od_date:
+            plan_key = "od_date"
         else:
             plan_key = "none"
         
@@ -1497,12 +1522,20 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 try:
                     plan_data = parse_explain_plan(runner, st.session_state.query_input.current)
                     st.session_state.original_plan = plan_data
+                    plan_errors = []
+                    if plan_data.get('error'):
+                        plan_errors.append(f"Original query: {plan_data['error']}")
                     
                     if st.session_state.get("rewritten_query"):
                         rewr_plan_data = parse_explain_plan(runner, st.session_state.rewritten_query)
                         st.session_state.rewritten_plan = rewr_plan_data
+                        if rewr_plan_data.get('error'):
+                            plan_errors.append(f"Rewritten query: {rewr_plan_data['error']}")
                     
-                    st.success("Plans generated!")
+                    if plan_errors:
+                        st.error("EXPLAIN PLAN failed:\n\n" + "\n\n".join(plan_errors))
+                    else:
+                        st.success("Plans generated!")
                 except Exception as e:
                     st.error(f"Failed to generate plans: {str(e)}")
     
