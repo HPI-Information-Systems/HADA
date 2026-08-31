@@ -66,6 +66,8 @@ def reset_dependency_state():
     if hasattr(st.session_state, 'runner'):
         st.session_state.runner.valid_fds.clear()
         st.session_state.runner.valid_ods.clear()
+        st.session_state.runner.valid_fd_genuineness.clear()
+        st.session_state.runner.valid_od_genuineness.clear()
 
 
 def remove_duplicate_hints(query_str):
@@ -511,6 +513,7 @@ def main():
             st.session_state.candidate_deps = []
             st.session_state.user_validated_fds = {}
             st.session_state.user_validated_ods = {}
+            st.session_state.user_validated_scores = {}
             st.session_state.query_input.current = ""
             st.session_state.query_input.previous = ""
             st.session_state.has_query = False
@@ -527,12 +530,16 @@ def main():
             # Also clear pending demo data so it won't auto-load
             st.session_state.pending_demo_fds = {}
             st.session_state.pending_demo_ods = {}
+            st.session_state.pending_demo_fd_scores = {}
+            st.session_state.pending_demo_od_scores = {}
             st.session_state.pending_demo_candidates = []
             st.session_state.just_loaded_demo_query = False
             # Clear runner data
             if hasattr(st.session_state, 'runner'):
                 st.session_state.runner.valid_fds.clear()
                 st.session_state.runner.valid_ods.clear()
+                st.session_state.runner.valid_fd_genuineness.clear()
+                st.session_state.runner.valid_od_genuineness.clear()
             st.rerun()
 
     # Demo queries with query plan variants based on selected dependencies
@@ -569,6 +576,17 @@ WHERE d_year BETWEEN 2000 AND 2002
                 Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"), Column("date_dim", "d_moy"))},
                 # OD ca_address_sk |-> ca_country: enables BETWEEN predicate
                 Column("customer_address", "ca_address_sk"): {(Column("customer_address", "ca_country"),)},
+            },
+            # Illustrative genuineness scores for the valid dependencies above, so
+            # demo mode shows the same score tags as a live connection would.
+            "fd_scores": {
+                Column("catalog_returns_sanitized", "cr_order_number"): {Column("catalog_returns_sanitized", "cr_item_sk"): 0.95},
+                Column("catalog_sales_sanitized", "cs_order_number"): {Column("catalog_sales_sanitized", "cs_item_sk"): 0.66},
+                Column("customer", "c_customer_sk"): {Column("customer", "c_customer_id"): 1.0},
+            },
+            "od_scores": {
+                Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"), Column("date_dim", "d_moy")): 0.82},
+                Column("customer_address", "ca_address_sk"): {(Column("customer_address", "ca_country"),): 0.9},
             },
             "candidates": [
                 ("FD", Column("customer", "c_customer_sk"), {Column("customer", "c_birth_country")}, 0.9),
@@ -678,6 +696,9 @@ WHERE d_year = 2001 AND d_moy > 2;""",
                 # OD d_year, d_moy -> d_date_sk
                 Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"), Column("date_dim", "d_moy"))}
             },
+            "od_scores": {
+                Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"), Column("date_dim", "d_moy")): 0.85},
+            },
             "candidates": [
                 ("FD", Column("catalog_sales_sanitized", "cs_order_number"), {Column("catalog_sales_sanitized", "cs_warehouse_sk")}, 0.4),
                 ("OD", Column("date_dim", "d_date_sk"), [Column("date_dim", "d_week_seq")], 0.6),
@@ -729,6 +750,9 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
             "ods": {
                 # OD d_year -> d_date_sk
                 Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"),)},
+            },
+            "od_scores": {
+                Column("date_dim", "d_date_sk"): {(Column("date_dim", "d_year"),): 0.78},
             },
             "candidates": [
                 ("FD", Column("store", "s_store_sk"), {Column("store", "s_zip")}, 0.3),
@@ -800,10 +824,13 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
             st.session_state.candidate_deps = []
             st.session_state.user_validated_fds = {}
             st.session_state.user_validated_ods = {}
+            st.session_state.user_validated_scores = {}
             demo_entry = demo_queries_dict[selected_demo_query]
             # Store demo data for later use when "Discover" is clicked
             st.session_state.pending_demo_fds = demo_entry["fds"]
             st.session_state.pending_demo_ods = demo_entry["ods"]
+            st.session_state.pending_demo_fd_scores = demo_entry.get("fd_scores", {})
+            st.session_state.pending_demo_od_scores = demo_entry.get("od_scores", {})
             st.session_state.pending_demo_candidates = demo_entry.get("candidates", [])
             demo_query = demo_entry["query"]
             st.session_state.query_input.current = demo_query
@@ -879,7 +906,7 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
             tab_size=4,
             key=f"qOriginal-{st.session_state.query_render_key}",
             auto_update=True,
-            height=200,
+            height=215,
         )
         
         if not st.session_state.get("just_loaded_demo_query"):
@@ -932,6 +959,14 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                 if st.session_state.get("pending_demo_ods"):
                     for k, v in st.session_state.pending_demo_ods.items():
                         runner.valid_ods[k] = v
+                # Populate the valid-dependency genuineness scores so the VALID tags
+                # carry a score in demo mode, just like they do on a live connection.
+                if st.session_state.get("pending_demo_fd_scores"):
+                    for k, v in st.session_state.pending_demo_fd_scores.items():
+                        runner.valid_fd_genuineness[k] = dict(v)
+                if st.session_state.get("pending_demo_od_scores"):
+                    for k, v in st.session_state.pending_demo_od_scores.items():
+                        runner.valid_od_genuineness[k] = dict(v)
                 if st.session_state.get("pending_demo_candidates"):
                     st.session_state.candidate_deps = st.session_state.pending_demo_candidates
                 st.success("Demo dependencies discovered!")
@@ -1011,8 +1046,21 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
         # Build valid dependencies list - showing user-validated separately
         valid_dependencies = []
         dep_details = {}
+        # label -> genuineness score for auto-discovered valid deps (None for
+        # user-validated ones, which are never scored).
+        dep_scores = {}
         fd_count = 0
         od_count = 0
+
+        def valid_fd_score(lhs, rhs_cols):
+            # A grouped FD label may cover several rhs columns; report the lowest
+            # (worst) score among the ones we have a score for.
+            scores = [
+                runner.valid_fd_genuineness[lhs][c]
+                for c in rhs_cols
+                if lhs in runner.valid_fd_genuineness and c in runner.valid_fd_genuineness[lhs]
+            ]
+            return min(scores) if scores else None
         
         # Get user-validated dependency labels to exclude from merged display
         user_val_labels = st.session_state.get("manually_added_deps", set())
@@ -1038,13 +1086,15 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                     label = f"FD: {lhs} -> {{{', '.join(str(col) for col in original_rhs)}}}"
                     valid_dependencies.append(label)
                     dep_details[label] = ('FD', lhs, original_rhs)
+                    dep_scores[label] = valid_fd_score(lhs, original_rhs)
                     fd_count += 1
-        
+
         # Add user-validated FDs as separate entries
         for uv_label, (uv_lhs, uv_rhs) in user_val_fds.items():
             if uv_label not in [d for d in valid_dependencies]:
                 valid_dependencies.append(uv_label)
                 dep_details[uv_label] = ('FD', uv_lhs, uv_rhs)
+                dep_scores[uv_label] = st.session_state.get("user_validated_scores", {}).get(uv_label)
                 fd_count += 1
         
         # Handle ODs
@@ -1060,13 +1110,16 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                     if label not in user_val_labels or label not in user_val_ods:
                         valid_dependencies.append(label)
                         dep_details[label] = ('OD', lhs, rhs)
+                        rhs_key = tuple(rhs) if isinstance(rhs, (list, tuple)) else rhs
+                        dep_scores[label] = runner.valid_od_genuineness.get(lhs, {}).get(rhs_key)
                         od_count += 1
-        
-        # Add user-validated ODs as separate entries  
+
+        # Add user-validated ODs as separate entries
         for uv_label, (uv_lhs, uv_rhs) in user_val_ods.items():
             if uv_label not in [d for d in valid_dependencies]:
                 valid_dependencies.append(uv_label)
                 dep_details[uv_label] = ('OD', uv_lhs, uv_rhs)
+                dep_scores[uv_label] = st.session_state.get("user_validated_scores", {}).get(uv_label)
                 od_count += 1
         
         # Summary metrics
@@ -1116,15 +1169,22 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                         
                         with dep_row[1]:
                             badge_class = "fd-badge" if dtype == "FD" else "od-badge"
-                            manual_badge = '<span class="dep-badge manual-badge">MANUAL</span>' if is_selected else ""
                             user_val_badge = '<span class="dep-badge user-validated-badge">USER VALIDATED</span>' if is_user_validated else '<span class="dep-badge valid-badge">VALID</span>'
-                            # Only show column names 
+                            # Genuineness score tag (same scale as the invalid candidates below).
+                            score = dep_scores.get(label)
+                            if score is not None:
+                                score_label = "Genuine" if score >= 0.8 else "Medium genuine" if score >= 0.5 else "Not genuine"
+                                score_class = "high-score-badge" if score >= 0.8 else "medium-score-badge" if score >= 0.5 else "low-score-badge"
+                                score_badge = f'<span class="dep-score {score_class}">{score_label} ({score:.2f})</span>'
+                            else:
+                                score_badge = ""
+                            # Only show column names
                             lhs_col = lhs.column_name if hasattr(lhs, 'column_name') else str(lhs)
                             if isinstance(rhs, (set, frozenset, list, tuple)):
                                 rhs_display = ", ".join(c.column_name if hasattr(c, 'column_name') else str(c) for c in rhs)
                             else:
                                 rhs_display = rhs.column_name if hasattr(rhs, 'column_name') else str(rhs)
-                            st.markdown(f'<span class="dep-badge {badge_class}">{dtype}</span>{user_val_badge}{manual_badge} <strong>{lhs_col}</strong> {"->" if dtype == "FD" else "↦"} <strong>{rhs_display}</strong>', unsafe_allow_html=True)
+                            st.markdown(f'<span class="dep-badge {badge_class}">{dtype}</span>{user_val_badge} {score_badge} <strong>{lhs_col}</strong> {"->" if dtype == "FD" else "↦"} <strong>{rhs_display}</strong>', unsafe_allow_html=True)
                         
                         with dep_row[2]:
                             # Show different buttons based on dependency state
@@ -1176,19 +1236,13 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                                         st.session_state.selected_dependencies_set.discard(label)
                                         if label in st.session_state.selected_dep_colors:
                                             del st.session_state.selected_dep_colors[label]
-                                        # Re-add to candidate_deps so it appears in Invalid section
-                                        # Parse the dependency from the label
-                                        if dtype == "FD":
-                                            # Add back to candidate_deps list
-                                            if not any(c[1] == lhs and c[2] == rhs for c in st.session_state.get("candidate_deps", [])):
-                                                if "candidate_deps" not in st.session_state:
-                                                    st.session_state.candidate_deps = []
-                                                st.session_state.candidate_deps.append((dtype, lhs, rhs, 0.5))
-                                        else:  # OD
-                                            if not any(c[1] == lhs and c[2] == rhs for c in st.session_state.get("candidate_deps", [])):
-                                                if "candidate_deps" not in st.session_state:
-                                                    st.session_state.candidate_deps = []
-                                                st.session_state.candidate_deps.append((dtype, lhs, rhs, 0.5))
+                                        # Re-add to candidate_deps so it appears in Invalid section,
+                                        # restoring the score it carried before being validated.
+                                        restored_score = st.session_state.get("user_validated_scores", {}).pop(label, 0.5)
+                                        if not any(c[1] == lhs and c[2] == rhs for c in st.session_state.get("candidate_deps", [])):
+                                            if "candidate_deps" not in st.session_state:
+                                                st.session_state.candidate_deps = []
+                                            st.session_state.candidate_deps.append((dtype, lhs, rhs, restored_score))
                                         
                                         # Also remove from validated_candidates if present
                                         cand_key = f"{dtype}_{lhs}_{rhs}"
@@ -1232,7 +1286,9 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                         is_validated = cand_key in st.session_state.validated_candidates
                         
                         if not is_validated:  # Only show invalid ones here
-                            cand_row = st.columns([0.08, 0.72, 0.2])
+                            # Same column ratios as the valid-dependency rows above so
+                            # the FD/OD badges line up at the same level and width.
+                            cand_row = st.columns([0.06, 0.59, 0.35])
                             
                             with cand_row[0]:
                                 st.markdown('<div style="width: 20px; height: 20px; border: 2px dashed #999; border-radius: 50%;"></div>', unsafe_allow_html=True)
@@ -1243,7 +1299,7 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                                 crhs_display = ", ".join(str(c) for c in crhs) if isinstance(crhs, (set, frozenset, list, tuple)) else str(crhs)
                                 score_class = "high-score-badge" if cscore >= 0.8 else "medium-score-badge" if cscore >= 0.5 else "low-score-badge"
 
-                                st.markdown(f'<span class="dep-badge {badge_class}">{ctype}</span><span class="dep-badge invalid-badge">INVALID</span> <span class="dep-score {score_class}">{cscore_badge} ({cscore})</span> <strong>{clhs}</strong> {"->" if ctype == "FD" else "↦"} <strong>{crhs_display}</strong>', unsafe_allow_html=True)
+                                st.markdown(f'<span class="dep-badge {badge_class}">{ctype}</span><span class="dep-badge invalid-badge">INVALID</span> <span class="dep-score {score_class}">{cscore_badge} ({cscore:.2f})</span> <strong>{clhs}</strong> {"->" if ctype == "FD" else "↦"} <strong>{crhs_display}</strong>', unsafe_allow_html=True)
                             
                             with cand_row[2]:
                                 if st.button("Mark as valid", key=f"cand_btn_{cidx}", type="secondary", use_container_width=True):
@@ -1276,6 +1332,9 @@ WHERE d_year = 2002 AND s_state = 'TN';""",
                                         if clhs not in runner.valid_ods:
                                             runner.valid_ods[clhs] = set()
                                         runner.valid_ods[clhs].add(rhs_tuple)
+                                    # Keep the candidate's genuineness score so the
+                                    # user-validated entry can still display it.
+                                    st.session_state.setdefault("user_validated_scores", {})[manual_label] = cscore
                                     # Mark as user validated so it gets the USER VALIDATED badge
                                     st.session_state.manually_added_deps.add(manual_label)
                                     st.success("Dependency validated and marked as USER VALIDATED!")

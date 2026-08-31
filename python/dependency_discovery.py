@@ -24,8 +24,14 @@ class DependencyDiscoveryRunner:
         # FD candidate that validate_fd() finds invalid.
         self.fd_genuineness = defaultdict(dict)
         # determinant -> {rhs_tuple: genuineness_score}, populated for every
-        # OD candidate that validate_od_with_query() finds invalid.
+        # OD candidate that validation finds invalid (via add_invalid_od,
+        # regardless of the OD validation strategy used).
         self.od_genuineness = defaultdict(dict)
+        # Same as fd_genuineness/od_genuineness, but for the dependencies that
+        # validation finds to actually hold - scored the same way so valid and
+        # invalid dependencies can be compared on the same scale.
+        self.valid_fd_genuineness = defaultdict(dict)
+        self.valid_od_genuineness = defaultdict(dict)
         self.cursor = None
         self.connection = None
         self.fd_rewrite = fd_rewrite
@@ -587,7 +593,11 @@ class DependencyDiscoveryRunner:
             is_dependent = int(res[0][2 * dependent_idx]) == 1
             no_nulls = int(res[0][2 * dependent_idx + 1]) == 0
             if is_dependent and no_nulls:
-                self.valid_fds[determinant].add(dependent_columns[dependent_idx])
+                dependent_column = dependent_columns[dependent_idx]
+                self.valid_fds[determinant].add(dependent_column)
+                self.valid_fd_genuineness[determinant][dependent_column] = self.compute_fd_genuineness(
+                    determinant, dependent_column
+                )
             else:
                 dependent_column = dependent_columns[dependent_idx]
                 self.invalid_fds[determinant].add(dependent_column)
@@ -826,11 +836,7 @@ class DependencyDiscoveryRunner:
             if marker == 0:
                 self.add_valid_od(determinant, tuple(permutations[result_id]))
             else:
-                rhs_tuple = tuple(permutations[result_id])
-                self.invalid_ods[determinant].add(rhs_tuple)
-                self.od_genuineness[determinant][rhs_tuple] = self.compute_od_genuineness(
-                    determinant, list(rhs_tuple)
-                )
+                self.add_invalid_od(determinant, tuple(permutations[result_id]))
 
     def validate_od_with_query_rank(self, common_table, determinant, permutations):
         query_template = """SELECT {0}
@@ -871,7 +877,7 @@ class DependencyDiscoveryRunner:
             if marker >= 0:
                 self.add_valid_od(determinant, tuple(permutations[result_id]))
             else:
-                self.invalid_ods[determinant].add(tuple(permutations[result_id]))
+                self.add_invalid_od(determinant, tuple(permutations[result_id]))
 
     def validate_od_with_checkers(self, common_table, determinant, permutations, unique_query_columns):
         query_template = "SELECT {0} FROM {1} ORDER BY {2} WITH HINT(IGNORE_PLAN_CACHE)"
@@ -916,7 +922,7 @@ class DependencyDiscoveryRunner:
                 self.add_valid_od(determinant, checker.to_od())
                 valid_count += 1
             else:
-                self.invalid_ods[determinant].add(checker.to_od())
+                self.add_invalid_od(determinant, checker.to_od())
 
     def run_od_checkers(self, query, checkers):
         fetch_next = True
@@ -957,9 +963,20 @@ class DependencyDiscoveryRunner:
                 # New OD refines already known OD. We cannot simply transform the existing one (stored as a tuple for
                 # hashability in the RHS set), so we have to delete the existing RHS and add the new one.
                 self.valid_ods[lhs].remove(known_rhs)
+                self.valid_od_genuineness[lhs].pop(known_rhs, None)
                 break
 
         self.valid_ods[lhs].add(rhs)
+        # Score the valid OD the same way invalid ones are scored (see
+        # add_invalid_od), so both can be compared on the same scale.
+        self.valid_od_genuineness[lhs][rhs] = self.compute_od_genuineness(lhs, list(rhs))
+
+    def add_invalid_od(self, lhs, rhs):
+        # Single registration point for invalid ODs (mirrors add_valid_od), used
+        # by all OD validation strategies so the genuineness score is computed
+        # regardless of which strategy rejected the OD.
+        self.invalid_ods[lhs].add(rhs)
+        self.od_genuineness[lhs][rhs] = self.compute_od_genuineness(lhs, list(rhs))
 
 
 class OdChecker:
